@@ -1,0 +1,2 @@
+# 批处理文件固定 CRLF 行尾，避免克隆/解压后 cmd 解析异常
+*.bat text eol=crlf

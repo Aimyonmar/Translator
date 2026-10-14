@@ -1,0 +1,6 @@
+numpy>=1.26
+requests>=2.31
+sounddevice>=0.5
+pyaudiowpatch>=0.2
+PySide6>=6.6
+faster-whisper>=1.0

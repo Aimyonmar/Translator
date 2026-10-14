@@ -1,0 +1,30 @@
+# ========== 不入库清单：提交到 GitHub 的只有「纯源码」 ==========
+
+# 运行环境与模型缓存（约 4.5 GB：venv + Whisper 模型 + pip 缓存）
+# ——完整重建方式见 README「一、启动」
+.runtime/
+
+# 本机生成的配置（设备、窗口位置、通道偏好；填入的 API Key 也存在这里）
+config.json
+
+# 运行日志（含本机绝对路径）
+*.log
+run.log
+
+# WorkBuddy 内部工作笔记（会话记忆、排查记录，不公开）
+.workbuddy/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 编辑器 / 系统杂物
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
