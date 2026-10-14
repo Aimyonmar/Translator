@@ -178,4 +178,5 @@ pip install pyinstaller
 pyinstaller --noconfirm --clean --windowed --onefile --name VTuberTranslator main.py
 ```
 
+> 本项目代码以 **MIT 协议**开源（见 [LICENSE](LICENSE)），可自由使用、修改、分发（保留版权声明即可）。
 > 注意：识别模型来自 OpenAI Whisper（MIT），翻译走各家在线服务，请勿用于商业转播。
