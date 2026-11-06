@@ -1,2 +1,4 @@
-# 批处理文件固定 CRLF 行尾，避免克隆/解压后 cmd 解析异常
-*.bat text eol=crlf
+# 批处理必须是 CRLF：cmd 解析 if()/goto 时遇到 LF 会直接退出（窗口一闪就没）
+# 用 -text（不做换行转换）而不是 eol=crlf：GitHub 源码 zip 直接打包仓库 blob 字节，
+# eol=crlf 只影响 checkout，归档里仍是 LF。
+*.bat -text
