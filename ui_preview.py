@@ -48,6 +48,13 @@ def _grab(widget, w: int, h: int, scroll_bottom: bool = False) -> QPixmap:
     widget.resize(w, h)
     widget.layout().activate()
     QApplication.processEvents()
+    # 分页容器：当前页再单独排一次，避免隐藏页未布局导致截图为空
+    stack = getattr(widget, "stack", None)
+    if stack is not None:
+        page = stack.currentWidget()
+        if page is not None and page.widget() is not None:
+            page.widget().layout().activate()
+            QApplication.processEvents()
     if scroll_bottom:
         sb = widget.scroll.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -134,28 +141,72 @@ def main() -> int:
     base.max_lines = 3
     base.geometry = None
 
+    # 默认横版尺寸（1120×760）：左导航 + 右侧当前页 + 底部日志条
     idle = _panel(AppConfig.load(), running=False)
-    _grab(idle, 760, 820).save(os.path.join(out_dir, "ui_panel_idle.png"), "PNG")
+    _grab(idle, 1120, 760).save(os.path.join(out_dir, "ui_panel_idle.png"), "PNG")
 
     running = _panel(AppConfig.load(), running=True)
-    _grab(running, 760, 820).save(os.path.join(out_dir, "ui_panel_running.png"), "PNG")
+    _grab(running, 1120, 760).save(os.path.join(out_dir, "ui_panel_running.png"), "PNG")
 
-    # 1080p 屏幕（1920×1080）下的窗口：内容超出可视区，靠滚动查看
+    # 各配置页：切页只走 panel.show_page()，分页结构不随截图脚本变化
+    asr = _panel(AppConfig.load(), running=False)
+    asr.show_page("asr")
+    _grab(asr, 1120, 760).save(os.path.join(out_dir, "ui_panel_asr.png"), "PNG")
+
+    trans = _panel(AppConfig.load(), running=True)
+    trans.show_page("trans")
+    _grab(trans, 1120, 760).save(os.path.join(out_dir, "ui_panel_trans.png"), "PNG")
+
+    ctx = _panel(AppConfig.load(), running=False)
+    ctx.show_page("context")
+    _grab(ctx, 1120, 760).save(os.path.join(out_dir, "ui_panel_context.png"), "PNG")
+
+    # 转写页：直接喂一段「已完成」的结果，不加载模型；
+    # 实时记录组也喂三条样例，截图能看到原文/译文与导出按钮的实际排版
+    trs = _panel(AppConfig.load(), running=False)
+    trs.show_page("transcribe")
+    trs.set_running(True)
+    trs._live_records = [
+        (0.0, 3.6, "みなさんこんばんは、今日も配信を始めていきます", "大家晚上好，今天也开始直播了"),
+        (3.6, 7.9, "今日は新しいゲームをやっていきます！", "今天要玩一款新游戏！"),
+        (7.9, 13.2, "このボスの第二形態、攻撃が全然読めなくて本当に難しい", ""),
+    ]
+    trs._live_index = {i: i for i in range(len(trs._live_records))}
+    trs._live_render()
+    trs.set_running(False)
+    trs._set_trs_source(r"D:\live\2026-11-05_杂谈回.mp4")
+    trs._on_trs_done((
+        [(0.0, 3.8, "みなさんこんばんは、今日も配信を始めていきます"),
+         (3.8, 8.2, "今日は新しいゲームをやっていきます！"),
+         (8.2, 14.6, "このボスの第二形態、攻撃が全然読めなくて本当に難しいんだよね"),
+         (14.6, 20.1, "それに加えて第三形態では雑魚を召喚してくるから"),
+         (20.1, 26.4, "みんなは僕のHPバーをちゃんと見ていてね")],
+        26.4, False))
+    _grab(trs, 1120, 760).save(os.path.join(out_dir, "ui_panel_transcribe.png"), "PNG")
+
+    adv = _panel(AppConfig.load(), running=False)
+    adv.show_page("advanced")
+    _grab(adv, 1120, 760).save(os.path.join(out_dir, "ui_panel_advanced.png"), "PNG")
+
+    # 1080p 屏幕（1920×1080）下的窗口：页内内容超出可视区，靠滚动查看
     big = _panel(AppConfig.load(), running=True)
+    big.show_page("asr")
     _grab(big, 1200, 860).save(os.path.join(out_dir, "ui_panel_1080p.png"), "PNG")
 
-    # 1366×768 小屏：窗口压到 1000×560，底栏固定可见
+    # 1366×768 小屏：窗口压到 1024×600，传输栏与日志条固定可见
     small = _panel(AppConfig.load(), running=True)
-    _grab(small, 1000, 560).save(os.path.join(out_dir, "ui_panel_1366x768.png"), "PNG")
-    _grab(small, 1000, 560, scroll_bottom=True).save(
+    _grab(small, 1024, 600).save(os.path.join(out_dir, "ui_panel_1366x768.png"), "PNG")
+    _grab(small, 1024, 600, scroll_bottom=True).save(
         os.path.join(out_dir, "ui_panel_1366x768_bottom.png"), "PNG")
 
     _overlay(base).save(os.path.join(out_dir, "ui_overlay_live.png"), "PNG")
 
     print("已输出：")
-    for name in ("ui_panel_idle.png", "ui_panel_running.png", "ui_panel_1080p.png",
-                 "ui_panel_1366x768.png", "ui_panel_1366x768_bottom.png",
-                 "ui_overlay_live.png"):
+    for name in ("ui_panel_idle.png", "ui_panel_running.png", "ui_panel_asr.png",
+                 "ui_panel_trans.png", "ui_panel_context.png",
+                 "ui_panel_transcribe.png", "ui_panel_advanced.png",
+                 "ui_panel_1080p.png", "ui_panel_1366x768.png",
+                 "ui_panel_1366x768_bottom.png", "ui_overlay_live.png"):
         print(" ", os.path.join(out_dir, name))
     return 0
 

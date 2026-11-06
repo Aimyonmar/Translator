@@ -348,18 +348,39 @@ QProgressBar::chunk {{
                                 stop:0 #2C87B8, stop:1 {ACCENT});
 }}
 
+/* ---------- 分页骨架：顶部传输栏 / 左侧导航 / 滚动内容 ---------- */
+/* 传输栏：比底色浅一档，和内容区之间用 1px 线分隔，滚动时层次不混 */
+QWidget#transport {{
+    background: #121722;
+    border-bottom: 1px solid {BORDER};
+}}
+QWidget#nav {{
+    background: #0A0D13;
+    border-right: 1px solid {BORDER};
+}}
+QPushButton#nav {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: {RADIUS_SM}px;
+    padding: 6px 12px;
+    text-align: left;
+    color: {TEXT_DIM};
+    font-weight: 600;
+}}
+QPushButton#nav:hover {{ background: #161C25; color: {TEXT}; }}
+QPushButton#nav:checked {{
+    background: #16283A;
+    border-color: #23445C;
+    color: {ACCENT};
+}}
+
 /* ---------- 滚动容器 ---------- */
 QScrollArea {{
     background: {BG};
     border: none;
 }}
 QScrollArea > QWidget > QWidget {{ background: {BG}; }}
-QWidget#scrollContent {{ background: {BG}; }}
-/* 固定底栏：与滚动内容之间用一条 1px 线分隔，滚动时层次不混 */
-QWidget#footer {{
-    background: {BG};
-    border-top: 1px solid {BORDER};
-}}
+QWidget#page {{ background: {BG}; }}
 
 /* ---------- 滚动条 ---------- */
 QScrollBar:vertical {{

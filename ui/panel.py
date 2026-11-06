@@ -2,16 +2,19 @@
 """控制面板：设备 / 模型 / 翻译 / 字幕 参数调节与运行状态。"""
 from __future__ import annotations
 
+import os
 import threading
-from typing import List, Optional
+import time
+from datetime import datetime
+from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt, Signal, QTimer, QEvent
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QStandardPaths
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout, QGroupBox, QLabel,
     QComboBox, QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox,
     QPlainTextEdit, QProgressBar, QMessageBox, QLineEdit, QScrollArea, QFrame,
-    QApplication, QAbstractSpinBox,
+    QApplication, QAbstractSpinBox, QButtonGroup, QStackedWidget, QFileDialog,
 )
 
 from core import model_store
@@ -50,6 +53,14 @@ class ControlPanel(QWidget):
     sig_mdl_log = Signal(str)
     sig_mdl_done = Signal()
     sig_mdl_fail = Signal(str)
+    # 音频转文字：转写在后台线程读整段文件，进度/结果同样用信号回主线程
+    sig_trs_progress = Signal(int)
+    sig_trs_status = Signal(str)
+    sig_trs_done = Signal(object)       # (句段列表, 总时长秒, 是否被取消)
+    sig_trs_fail = Signal(str)
+    # 实时记录：原文上屏与译文上屏各来一次，按上屏顺序在面板里累积成转写稿
+    sig_live_partial = Signal(int, str)
+    sig_live_line = Signal(int, str, str)
 
     def __init__(self, cfg, controller):
         super().__init__()
@@ -57,9 +68,22 @@ class ControlPanel(QWidget):
         self.ctrl = controller
         self._running = False
         self._mdl_busy: Optional[str] = None
+        # 音频转文字：与实时字幕互斥，同一时间只让一份模型干活
+        self._transcribing = False
+        self._trs_path = ""
+        self._trs_segments: List[tuple] = []
+        # 实时记录：(起始秒, 结束秒, 原文, 译文)，按上屏顺序追加，只在内存里累积。
+        # 用流水线的 seq 对齐：原文先到（记起始时间），译文后到（补该行并收尾）。
+        self._live_records: List[Tuple[float, float, str, str]] = []
+        self._live_open: dict = {}       # seq -> 记录下标：已上屏原文、还没等到译文
+        self._live_index: dict = {}      # seq -> 记录下标：停止收尾后译文晚到也能回填
+        self._live_t0: Optional[float] = None   # 本轮 monotonic 起点；None = 未运行
+        self._live_origin = 0.0          # 本轮时间轴起点（接着上一轮结尾）
+        self._live_frozen = 0.0          # 停止瞬间的秒数，用来给最后一句收尾
         self.setWindowTitle("VTuber 实时翻译器")
         self.setWindowIcon(_icon())
-        self.setMinimumWidth(520)
+        # 横版：左导航 132 + 内容区，低于这个尺寸表单会挤成两行
+        self.setMinimumSize(900, 580)
         self.sig_status.connect(self._set_status)
         self.sig_level.connect(self._set_level)
         self.sig_log.connect(self._log)
@@ -72,6 +96,12 @@ class ControlPanel(QWidget):
         self.sig_mdl_log.connect(self._log)
         self.sig_mdl_done.connect(self._on_mdl_done)
         self.sig_mdl_fail.connect(self._on_mdl_fail)
+        self.sig_trs_progress.connect(self._on_trs_progress)
+        self.sig_trs_status.connect(self._on_trs_status)
+        self.sig_trs_done.connect(self._on_trs_done)
+        self.sig_trs_fail.connect(self._on_trs_fail)
+        self.sig_live_partial.connect(self._on_live_partial)
+        self.sig_live_line.connect(self._on_live_line)
         self._apply_default_size()
         # 滚轮防误触：整窗统一过滤，滑过下拉框/数值框时先滚页面（见 eventFilter）
         app = QApplication.instance()
@@ -79,39 +109,89 @@ class ControlPanel(QWidget):
             app.installEventFilter(self)
 
     # ------------------------------------------------------------ UI
+    # 页面定义收敛在这一处：新增一页 = 这里加一行 + 写一个 _build_page_xxx()，
+    # 顶部传输栏 / 左侧分页 / 右侧内容区 的骨架不用改。
+    PAGES: Tuple[Tuple[str, str, str], ...] = (
+        ("device", "设备", "_build_page_device"),
+        ("asr", "识别", "_build_page_asr"),
+        ("trans", "翻译", "_build_page_trans"),
+        ("context", "语境", "_build_page_context"),
+        ("transcribe", "转写", "_build_page_transcribe"),
+        ("advanced", "高级", "_build_page_advanced"),
+    )
+
+    @staticmethod
+    def _page_shell():
+        """一页的容器：统一内边距与间距，页面内容从上往下堆。"""
+        page = QWidget()
+        page.setObjectName("page")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(12)
+        return page, lay
+
     def _build(self) -> None:
-        # 外层只放「可滚动内容 + 固定底栏」：窗口再矮，开始/暂停/隐藏字幕也点得到
+        # 三段式：顶部传输栏（固定）→ 左侧分页 → 右侧内容区（当前页 + 日志条）
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+        outer.addWidget(self._build_transport())
 
-        self.scroll = QScrollArea(self)
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        body = QWidget()
+        bh = QHBoxLayout(body)
+        bh.setContentsMargins(0, 0, 0, 0)
+        bh.setSpacing(0)
+        bh.addWidget(self._build_nav())
 
-        content = QWidget()
-        content.setObjectName("scrollContent")
-        self._content = content
-        root = QVBoxLayout(content)
-        root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(12)
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(0)
+        self.stack = QStackedWidget()
+        self._pages = {}
+        self._page_scrolls = {}
+        for key, _title, builder in self.PAGES:
+            page = getattr(self, builder)()
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setFrameShape(QFrame.NoFrame)
+            sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            sc.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            sc.setWidget(page)
+            self.stack.addWidget(sc)
+            self._pages[key] = page
+            self._page_scrolls[key] = sc
+        rv.addWidget(self.stack, 1)
+        rv.addWidget(self._build_console())
+        bh.addWidget(right, 1)
+        outer.addWidget(body, 1)
 
-        # 标题区：一眼看清「这是什么 + 链路怎么走」，比直接堆表单更有层次
-        head = QVBoxLayout()
-        head.setSpacing(2)
+        self.show_page(self.PAGES[0][0])
+        # 统一样式在最后一次性套上：控件都建好了，QSS 才能一次覆盖全部
+        theme.apply(self)
+
+    # ------------------------------------------------------------ 骨架
+    def _build_transport(self) -> QWidget:
+        """顶部传输栏：主操作 + 运行状态 + 实时指标，任何分页下都固定可见。"""
+        bar = QWidget()
+        bar.setObjectName("transport")
+        v = QVBoxLayout(bar)
+        v.setContentsMargins(18, 14, 18, 12)
+        v.setSpacing(10)
+
+        # 标题区：一眼看清「这是什么 + 链路怎么走」
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
         lbl_title = QLabel("VTuber 实时翻译器")
         lbl_title.setObjectName("appTitle")
         lbl_sub = QLabel("系统声音 → 语音识别 → 翻译 → 悬浮字幕")
         lbl_sub.setObjectName("appSubtitle")
-        head.addWidget(lbl_title)
-        head.addWidget(lbl_sub)
-        root.addLayout(head)
-
-        # 状态
-        box_state = QGroupBox("运行状态")
-        h = QHBoxLayout(box_state)
+        title_col.addWidget(lbl_title)
+        title_col.addWidget(lbl_sub)
+        head.addLayout(title_col)
+        head.addStretch(1)
         self.lbl_state = QLabel("未启动")
         self.lbl_state.setObjectName("stateValue")
         self.bar = QProgressBar()
@@ -120,10 +200,92 @@ class ControlPanel(QWidget):
         self.bar.setTextVisible(False)
         lbl_vol = QLabel("音量")
         lbl_vol.setObjectName("hint")
-        h.addWidget(self.lbl_state, 1)
-        h.addWidget(lbl_vol)
-        h.addWidget(self.bar)
-        root.addWidget(box_state)
+        head.addWidget(self.lbl_state)
+        head.addWidget(lbl_vol)
+        head.addWidget(self.bar)
+        v.addLayout(head)
+
+        # 主操作固定在顶栏：切到哪一页、内容滚到哪，开始/暂停/隐藏字幕都点得到
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.btn_start = QPushButton("开始翻译")
+        # 主操作只在视觉上突出：运行中换成警示色，停下来的动作一眼可见
+        self.btn_start.setObjectName("primary")
+        self.btn_start.setFixedHeight(38)
+        self.btn_start.clicked.connect(self.ctrl.toggle_start)
+        self.btn_pause = QPushButton("暂停")
+        self.btn_pause.setFixedHeight(38)
+        self.btn_pause.clicked.connect(self.ctrl.toggle_pause)
+        self.btn_sub = QPushButton("隐藏字幕")
+        self.btn_sub.setFixedHeight(38)
+        self.btn_sub.clicked.connect(self.ctrl.toggle_subtitle)
+        row.addWidget(self.btn_start, 2)
+        row.addWidget(self.btn_pause, 1)
+        row.addWidget(self.btn_sub, 1)
+        v.addLayout(row)
+        return bar
+
+    def _build_nav(self) -> QWidget:
+        """左侧分页导航：按钮由 PAGES 生成，加页不用改这里。"""
+        nav = QWidget()
+        nav.setObjectName("nav")
+        nav.setFixedWidth(132)
+        v = QVBoxLayout(nav)
+        v.setContentsMargins(10, 14, 10, 12)
+        v.setSpacing(4)
+        self._nav_buttons = {}
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
+        for key, title, _builder in self.PAGES:
+            btn = QPushButton(title)
+            btn.setObjectName("nav")
+            btn.setCheckable(True)
+            btn.setFixedHeight(34)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, k=key: self.show_page(k))
+            self._nav_group.addButton(btn)
+            v.addWidget(btn)
+            self._nav_buttons[key] = btn
+        v.addStretch(1)
+        hint = QLabel("配置改动即时生效\n并自动保存")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        return nav
+
+    def _build_console(self) -> QWidget:
+        """底部日志条：不随分页切换，识别/翻译发生了什么始终看得见。"""
+        wrap = QWidget()
+        wrap.setObjectName("consoleWrap")
+        v = QVBoxLayout(wrap)
+        v.setContentsMargins(18, 10, 18, 14)
+        v.setSpacing(0)
+        self.log = QPlainTextEdit()
+        self.log.setObjectName("console")
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(300)
+        self.log.setFixedHeight(126)
+        # 显式给文档设字体：只靠 QSS 定字号时，文档行高与绘制字体对不上，多行会挤在一起
+        self.log.setFont(QFont("Microsoft YaHei UI", 10))
+        self.log.document().setDefaultFont(self.log.font())
+        v.addWidget(self.log)
+        return wrap
+
+    def show_page(self, key: str) -> None:
+        """切到指定分页；未知 key 忽略。预览脚本也走这个入口。"""
+        sc = self._page_scrolls.get(key)
+        if sc is None:
+            return
+        self.stack.setCurrentWidget(sc)
+        # 滚轮过滤器与预览工具都按「当前页的滚动区」工作
+        self.scroll = sc
+        btn = self._nav_buttons.get(key)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+
+    # ------------------------------------------------------------ 分页
+    def _build_page_device(self) -> QWidget:
+        page, root = self._page_shell()
 
         # 音频
         box_audio = QGroupBox("音频输入（默认抓取电脑系统声音）")
@@ -139,15 +301,23 @@ class ControlPanel(QWidget):
         self.cmb_device.currentIndexChanged.connect(self._on_device_changed)
         root.addWidget(box_audio)
 
-        # 识别
-        box_asr = QGroupBox("语音识别（Whisper）")
-        f = QFormLayout(box_asr)
+        # 识别模型：用哪份权重、跑在哪个运算设备上
+        box_model = QGroupBox("识别模型（Whisper）")
+        f = QFormLayout(box_model)
         self.cmb_model = QComboBox()
         self.cmb_model.addItems(MODEL_SIZES)
         # 填初值时先屏蔽信号：否则一构建就触发保存，把 gpu_ok / last_channel 冲掉
         self.cmb_model.blockSignals(True)
         self.cmb_model.setCurrentText(self.cfg.model_size)
         self.cmb_model.blockSignals(False)
+        self.cmb_model.setToolTip(
+            "small：最快（约 0.2s），直播口语识别一般。\n"
+            "medium：口语/专有名词识别明显更准，GPU 下约 0.5s。\n"
+            "口语多的直播建议换 medium。\n"
+            "large-v3：识别最准（尤其口音/外来语/嘈杂），GPU 下约 1s，最吃显存；\n"
+            "6~8GB 显卡会自动改用 int8 跑。\n"
+            "显存被游戏占用放不下时会自动临时降级到 medium/small 保速度\n"
+            "（状态栏会提示），关掉游戏重启即可回到大模型。")
         self.cmb_model.currentTextChanged.connect(self._on_model_changed)
         self.cmb_dev = QComboBox()
         self.cmb_dev.addItems(["auto", "cpu", "cuda"])
@@ -160,6 +330,44 @@ class ControlPanel(QWidget):
         row2.addWidget(QLabel("运算"))
         row2.addWidget(self.cmb_dev)
         f.addRow("模型 / 设备", row2)
+        root.addWidget(box_model)
+
+        # 模型缓存：状态直接读磁盘上的真实文件；已下载的只给「卸载」，
+        # 没有下载入口，从 UI 上就堵死重复下载。
+        box_mdl = QGroupBox("模型缓存（已下载的可离线使用，卸载即释放磁盘）")
+        grid = QGridLayout(box_mdl)
+        grid.setContentsMargins(2, 2, 2, 6)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+        self._mdl_rows = {}
+        for r, size in enumerate(MODEL_SIZES):
+            lbl_name = QLabel(size)
+            lbl_name.setMinimumWidth(72)
+            lbl_state = QLabel("…")
+            lbl_state.setObjectName("hint")
+            btn = QPushButton("下载")
+            btn.setFixedWidth(88)
+            btn.clicked.connect(lambda _=False, s=size: self._on_mdl_click(s))
+            grid.addWidget(lbl_name, r, 0)
+            grid.addWidget(lbl_state, r, 1)
+            grid.addWidget(btn, r, 2)
+            self._mdl_rows[size] = (lbl_state, btn)
+        self.lbl_mdl_total = QLabel("")
+        self.lbl_mdl_total.setObjectName("hint")
+        grid.addWidget(self.lbl_mdl_total, len(MODEL_SIZES), 0, 1, 3)
+        root.addWidget(box_mdl)
+        self._refresh_models()
+
+        root.addStretch(1)
+        return page
+
+    def _build_page_asr(self) -> QWidget:
+        page, root = self._page_shell()
+
+        # 识别增强：专有名词 / 热词 / 降噪 / 人声 / 解码宽度
+        box_asr = QGroupBox("识别增强（专有名词 / 噪声 / 解码）")
+        f = QFormLayout(box_asr)
         self.txt_wordmap = QLineEdit(self.cfg.word_map or "")
         self.txt_wordmap.setPlaceholderText("听错的人名/梗：误=正，逗号分隔。例：うさだぺこら=兎田ぺこら,ほろらいぶ=ホロライブ")
         self.txt_wordmap.editingFinished.connect(self._on_wordmap)
@@ -243,42 +451,17 @@ class ControlPanel(QWidget):
             "解码宽度：1=最快（贪心），2=快且稳（默认），3~5=更准但明显更慢。\n"
             "用 large-v3 还想再快就拖到 1；想更准往上拖。改完即时生效，不用重启。")
         self.sp_beam.valueChanged.connect(self._on_beam)
-        f.addRow("解码宽度", self.sp_beam)
-        self.cmb_model.setToolTip(
-            "small：最快（约 0.2s），直播口语识别一般。\n"
-            "medium：口语/专有名词识别明显更准，GPU 下约 0.5s。\n"
-            "口语多的直播建议换 medium。\n"
-            "large-v3：识别最准（尤其口音/外来语/嘈杂），GPU 下约 1s，最吃显存；\n"
-            "6~8GB 显卡会自动改用 int8 跑。\n"
-            "显存被游戏占用放不下时会自动临时降级到 medium/small 保速度\n"
-            "（状态栏会提示），关掉游戏重启即可回到大模型。")
+        self.sp_beam.setFixedWidth(88)   # 横版内容区很宽，不让数值框跟着铺满整行
+        row_beam = QHBoxLayout()
+        row_beam.addWidget(self.sp_beam)
+        row_beam.addStretch(1)
+        f.addRow("解码宽度", row_beam)
         root.addWidget(box_asr)
+        root.addStretch(1)
+        return page
 
-        # 模型缓存：状态直接读磁盘上的真实文件；已下载的只给「卸载」，
-        # 没有下载入口，从 UI 上就堵死重复下载。
-        box_mdl = QGroupBox("模型缓存（已下载的可离线使用，卸载即释放磁盘）")
-        grid = QGridLayout(box_mdl)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(6)
-        grid.setColumnStretch(1, 1)
-        self._mdl_rows = {}
-        for r, size in enumerate(MODEL_SIZES):
-            lbl_name = QLabel(size)
-            lbl_name.setMinimumWidth(72)
-            lbl_state = QLabel("…")
-            lbl_state.setObjectName("hint")
-            btn = QPushButton("下载")
-            btn.setFixedWidth(88)
-            btn.clicked.connect(lambda _=False, s=size: self._on_mdl_click(s))
-            grid.addWidget(lbl_name, r, 0)
-            grid.addWidget(lbl_state, r, 1)
-            grid.addWidget(btn, r, 2)
-            self._mdl_rows[size] = (lbl_state, btn)
-        self.lbl_mdl_total = QLabel("")
-        self.lbl_mdl_total.setObjectName("hint")
-        grid.addWidget(self.lbl_mdl_total, len(MODEL_SIZES), 0, 1, 3)
-        root.addWidget(box_mdl)
-        self._refresh_models()
+    def _build_page_trans(self) -> QWidget:
+        page, root = self._page_shell()
 
         # 翻译
         box_tr = QGroupBox("翻译（免费通道无需 Key；填 Key 或代理可显著提升质量）")
@@ -359,6 +542,11 @@ class ControlPanel(QWidget):
         self.txt_health.setFixedHeight(96)
         f.addRow("", self.txt_health)
         root.addWidget(box_tr)
+        root.addStretch(1)
+        return page
+
+    def _build_page_context(self) -> QWidget:
+        page, root = self._page_shell()
 
         # 语境辅助（设计见 docs/语境翻译设计.md）：三个开关 + 前文条数 + 术语表。
         # 全部改动即存，运行时每句都重新读 cfg，不需要重启，也不需要通知控制器。
@@ -428,6 +616,108 @@ class ControlPanel(QWidget):
         self.sp_ctx.setEnabled(self.chk_context.isChecked())
         self.chk_free.setEnabled(self.chk_context.isChecked())
         root.addWidget(box_ctx)
+        root.addStretch(1)
+        return page
+
+    def _build_page_transcribe(self) -> QWidget:
+        page, root = self._page_shell()
+
+        # 实时记录：只做转写页顶部一块只读文本 + 三个操作，不加页、不动滚动结构。
+        # 数据来自流水线上屏顺序（见 main.py 的 on_partial / on_result），
+        # 与「文件转写」互不干扰；文件转写期间实时信号会被忽略。
+        box_live = QGroupBox("实时记录（按字幕上屏顺序累积）")
+        v_live = QVBoxLayout(box_live)
+        self.txt_live = QPlainTextEdit()
+        self.txt_live.setReadOnly(True)
+        self.txt_live.setMinimumHeight(110)
+        self.txt_live.setFont(QFont("Microsoft YaHei UI", 10))
+        self.txt_live.document().setDefaultFont(self.txt_live.font())
+        self.txt_live.setPlaceholderText(
+            "开始翻译后，这里按上屏顺序累积原文与译文；停止时会保留只有原文的句子。")
+        v_live.addWidget(self.txt_live, 1)
+        row_live = QHBoxLayout()
+        self.lbl_live_out = QLabel("")
+        self.lbl_live_out.setObjectName("hint")
+        self.lbl_live_out.setWordWrap(True)
+        row_live.addWidget(self.lbl_live_out, 1)
+        self.btn_live_clear = QPushButton("清空")
+        self.btn_live_txt = QPushButton("导出 TXT")
+        self.btn_live_srt = QPushButton("导出 SRT")
+        self.btn_live_clear.clicked.connect(self._on_live_clear)
+        self.btn_live_txt.clicked.connect(lambda: self._export_live("txt"))
+        self.btn_live_srt.clicked.connect(lambda: self._export_live("srt"))
+        for b in (self.btn_live_clear, self.btn_live_txt, self.btn_live_srt):
+            b.setEnabled(False)
+            row_live.addWidget(b)
+        v_live.addLayout(row_live)
+        root.addWidget(box_live)
+        self._live_update_out_label()
+
+        box_src = QGroupBox("源文件（本地音频 / 视频，一次转完）")
+        f = QFormLayout(box_src)
+        self.lbl_trs_file = QLabel("未选择")
+        self.lbl_trs_file.setObjectName("hint")
+        self.lbl_trs_file.setWordWrap(True)
+        self.btn_trs_pick = QPushButton("选择文件…")
+        self.btn_trs_pick.clicked.connect(self._on_trs_pick)
+        row = QHBoxLayout()
+        row.addWidget(self.lbl_trs_file, 1)
+        row.addWidget(self.btn_trs_pick)
+        f.addRow("文件", row)
+        self.lbl_trs_out = QLabel("导出目录：与源文件相同")
+        self.lbl_trs_out.setObjectName("hint")
+        f.addRow("", self.lbl_trs_out)
+        root.addWidget(box_src)
+
+        box_run = QGroupBox("转写")
+        v = QVBoxLayout(box_run)
+        row2 = QHBoxLayout()
+        self.btn_trs_start = QPushButton("开始转写")
+        self.btn_trs_start.setObjectName("primary")
+        self.btn_trs_start.setFixedHeight(36)
+        self.btn_trs_start.clicked.connect(self._on_trs_start)
+        self.btn_trs_cancel = QPushButton("取消")
+        self.btn_trs_cancel.setFixedHeight(36)
+        self.btn_trs_cancel.setEnabled(False)
+        self.btn_trs_cancel.clicked.connect(self._on_trs_cancel)
+        row2.addWidget(self.btn_trs_start, 2)
+        row2.addWidget(self.btn_trs_cancel, 1)
+        v.addLayout(row2)
+        self.bar_trs = QProgressBar()
+        self.bar_trs.setRange(0, 100)
+        self.bar_trs.setValue(0)
+        v.addWidget(self.bar_trs)
+        self.lbl_trs_state = QLabel("选好文件后点「开始转写」；与实时字幕互斥，不能同时跑。")
+        self.lbl_trs_state.setObjectName("hint")
+        # 导出按钮跟状态行放一起：结果再长也不会把「导出」挤到可视区外
+        row3 = QHBoxLayout()
+        row3.addWidget(self.lbl_trs_state, 1)
+        self.btn_trs_txt = QPushButton("导出 TXT")
+        self.btn_trs_srt = QPushButton("导出 SRT")
+        self.btn_trs_txt.setEnabled(False)
+        self.btn_trs_srt.setEnabled(False)
+        self.btn_trs_txt.clicked.connect(lambda: self._export_trs("txt"))
+        self.btn_trs_srt.clicked.connect(lambda: self._export_trs("srt"))
+        row3.addWidget(self.btn_trs_txt)
+        row3.addWidget(self.btn_trs_srt)
+        v.addLayout(row3)
+        root.addWidget(box_run)
+
+        box_res = QGroupBox("结果（带时间戳）")
+        v2 = QVBoxLayout(box_res)
+        self.txt_trs_result = QPlainTextEdit()
+        self.txt_trs_result.setReadOnly(True)
+        # 只定「最小」高度：默认 760 高时整页刚好放下「导出」按钮，窗口拉高再自动长高
+        self.txt_trs_result.setMinimumHeight(90)
+        self.txt_trs_result.setFont(QFont("Microsoft YaHei UI", 10))
+        self.txt_trs_result.document().setDefaultFont(self.txt_trs_result.font())
+        self.txt_trs_result.setPlaceholderText("转写完成后这里显示带时间戳的文本")
+        v2.addWidget(self.txt_trs_result, 1)
+        root.addWidget(box_res, 1)
+        return page
+
+    def _build_page_advanced(self) -> QWidget:
+        page, root = self._page_shell()
 
         # 断句
         box_vad = QGroupBox("断句灵敏度")
@@ -510,64 +800,25 @@ class ControlPanel(QWidget):
         f.addRow("", row7)
         root.addWidget(box_sub)
 
-        self.log = QPlainTextEdit()
-        self.log.setObjectName("console")
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(300)
-        self.log.setFixedHeight(150)
-        # 显式给文档设字体：只靠 QSS 定字号时，文档行高与绘制字体对不上，多行会挤在一起
-        self.log.setFont(QFont("Microsoft YaHei UI", 10))
-        self.log.document().setDefaultFont(self.log.font())
-        root.addWidget(self.log)
-
         tip = QLabel("提示：字幕窗可用鼠标拖动，右下角拖动改宽度，右键可调字号/背景/穿透。")
         tip.setObjectName("hint")
         tip.setWordWrap(True)
         root.addWidget(tip)
         root.addStretch(1)
-
-        self.scroll.setWidget(content)
-        outer.addWidget(self.scroll, 1)
-
-        # 固定底栏：三个操作按钮不随内容滚走，窗口压到最小也始终可见
-        footer = QWidget()
-        footer.setObjectName("footer")
-        self._footer = footer
-        row8 = QHBoxLayout(footer)
-        row8.setContentsMargins(18, 10, 18, 12)
-        row8.setSpacing(10)
-        self.btn_start = QPushButton("开始翻译")
-        # 主操作只在视觉上突出：运行中换成警示色，停下来的动作一眼可见
-        self.btn_start.setObjectName("primary")
-        self.btn_start.setFixedHeight(40)
-        self.btn_start.clicked.connect(self.ctrl.toggle_start)
-        self.btn_pause = QPushButton("暂停")
-        self.btn_pause.setFixedHeight(40)
-        self.btn_pause.clicked.connect(self.ctrl.toggle_pause)
-        self.btn_sub = QPushButton("隐藏字幕")
-        self.btn_sub.setFixedHeight(40)
-        self.btn_sub.clicked.connect(self.ctrl.toggle_subtitle)
-        row8.addWidget(self.btn_start, 2)
-        row8.addWidget(self.btn_pause, 1)
-        row8.addWidget(self.btn_sub, 1)
-        outer.addWidget(footer)
-
-        # 统一样式在最后一次性套上：控件都建好了，QSS 才能一次覆盖全部
-        theme.apply(self)
+        return page
 
     def _apply_default_size(self) -> None:
-        """默认窗口大小：内容放得下就按内容，放不下就贴到屏幕可用区域。
+        """默认横版尺寸：按分页布局取一个固定比例，再夹到屏幕可用区域内。
 
-        以前窗口直接按内容 sizeHint 展开（约 1440px 高），1080p 屏幕上底部按钮
-        会跑到屏幕外；现在最小尺寸由滚动区接管，默认尺寸再夹到可用区域以内。
+        分页后每页内容单独滚动，窗口尺寸不再由某一个页面的 sizeHint 决定；
+        默认 1120×760，小屏按可用区域收窄，最小尺寸由 setMinimumSize 兜底。
         """
-        hint = self._content.sizeHint()
         screen = QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen else None
         max_w = (avail.width() - 80) if avail else 1280
-        max_h = (avail.height() - 80) if avail else 680
-        w = max(720, min(hint.width(), max_w))
-        h = max(520, min(hint.height() + self._footer.sizeHint().height() + 8, max_h))
+        max_h = (avail.height() - 80) if avail else 800
+        w = max(900, min(1120, max_w))
+        h = max(580, min(760, max_h))
         self.resize(w, h)
 
     # ------------------------------------------------------------ 回调
@@ -605,7 +856,8 @@ class ControlPanel(QWidget):
                     lbl.setStyleSheet(f"color:{theme.TEXT_MUTED}; font-size:11px;")
                 btn.setText("下载")
                 btn.setToolTip("下载到本地缓存（走 hf-mirror 镜像）")
-            btn.setEnabled(not self._running and self._mdl_busy != size)
+            btn.setEnabled(not self._running and not self._transcribing
+                           and self._mdl_busy != size)
         if self._mdl_busy:
             _lbl, btn = self._mdl_rows[self._mdl_busy]
             btn.setText("处理中…")
@@ -795,7 +1047,257 @@ class ControlPanel(QWidget):
         self.cmb_device.setCurrentIndex(sel)
         self.cmb_device.blockSignals(False)
 
+    # ------------------------------------------------------------ 实时记录
+    def _live_time(self) -> float:
+        """本轮时间轴读数：运行中 = 起点 + 已过秒数；停止后 = 冻结时刻。"""
+        if self._live_t0 is None:
+            return self._live_frozen
+        return self._live_origin + (time.monotonic() - self._live_t0)
+
+    def _live_seal_prev(self, end: float) -> None:
+        """给还没收尾的记录补结束时间。
+
+        时间轴是近似值：起始 = 该句原文上屏时刻，结束 = 下一句起始时刻，
+        末句结束 = 停止时刻（见 _on_live_partial / set_running）。
+        """
+        for i, (a, b, src, tgt) in enumerate(self._live_records):
+            if b <= a:
+                self._live_records[i] = (a, max(a, end), src, tgt)
+
+    def _on_live_partial(self, seq: int, src: str) -> None:
+        """原文上屏：立刻落一条记录，译文先留空，保证丢帧跳号也不会错位。"""
+        if self._transcribing or not src or self._live_t0 is None:
+            return
+        if seq in self._live_index:
+            return
+        now = self._live_time()
+        self._live_seal_prev(now)
+        idx = len(self._live_records)
+        self._live_records.append((now, 0.0, src, ""))
+        self._live_open[seq] = idx
+        self._live_index[seq] = idx
+        self._live_render()
+
+    def _on_live_line(self, seq: int, src: str, tgt: str) -> None:
+        """译文回来：按 seq 回填同一行；停止后才到的译文也能回填。"""
+        if self._transcribing:
+            return
+        idx = self._live_index.get(seq)
+        if idx is None:
+            # 正常不会发生（译文一定跟在原文之后）。只在运行中补一条，
+            # 停止后不再凭空新增记录。
+            if self._live_t0 is None:
+                return
+            now = self._live_time()
+            self._live_seal_prev(now)
+            idx = len(self._live_records)
+            self._live_records.append((now, 0.0, src, tgt))
+            self._live_index[seq] = idx
+        else:
+            a, b, old_src, _old_tgt = self._live_records[idx]
+            self._live_records[idx] = (a, b, src or old_src, tgt)
+        self._live_open.pop(seq, None)
+        self._live_render()
+
+    def _live_render(self) -> None:
+        from core.transcribe import format_ts
+        lines = []
+        for a, _b, src, tgt in self._live_records:
+            line = f"[{format_ts(a)}] {src}"
+            if tgt:
+                line += "\n    " + tgt
+            lines.append(line)
+        self.txt_live.setPlainText("\n".join(lines))
+        sb = self.txt_live.verticalScrollBar()
+        sb.setValue(sb.maximum())
+        has = bool(self._live_records)
+        self.btn_live_clear.setEnabled(has)
+        self.btn_live_txt.setEnabled(has)
+        self.btn_live_srt.setEnabled(has)
+
+    def _live_update_out_label(self) -> None:
+        folder = (self.cfg.export_dir or "").strip()
+        self.lbl_live_out.setText(
+            f"导出目录：{folder}" if folder else "导出目录：文档（导出后自动记住）")
+        self.lbl_live_out.setToolTip(folder)
+
+    def _on_live_clear(self) -> None:
+        if not self._live_records:
+            return
+        ans = QMessageBox.question(
+            self, "清空实时记录",
+            f"清空当前 {len(self._live_records)} 条实时记录？\n已导出的文件不受影响。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans != QMessageBox.Yes:
+            return
+        self._live_records.clear()
+        self._live_open.clear()
+        self._live_index.clear()
+        self.txt_live.clear()
+        self.btn_live_clear.setEnabled(False)
+        self.btn_live_txt.setEnabled(False)
+        self.btn_live_srt.setEnabled(False)
+
+    def _export_live(self, kind: str) -> None:
+        """导出实时记录：复用 core/transcribe 的 TXT / SRT 格式。
+
+        文件名固定为 实时记录_YYYYmmdd_HHMMSS.txt/.srt，目录取配置里的导出目录
+        （未设置或已失效时落到「文档」，成功导出后写回配置）。
+        """
+        if not self._live_records:
+            return
+        from core.transcribe import to_srt, to_txt
+        segments = []
+        for a, b, src, tgt in self._live_records:
+            # SRT/TXT 都复用同一个 Segment 结构；有译文时原文与译文分两行显示
+            text = f"{src}\n{tgt}" if tgt else src
+            segments.append((a, max(a, b), text))
+        data = to_txt(segments) if kind == "txt" else to_srt(segments)
+        folder = (self.cfg.export_dir or "").strip()
+        if not folder or not os.path.isdir(folder):
+            folder = (QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+                      or os.path.expanduser("~"))
+        name = f"实时记录_{datetime.now():%Y%m%d_%H%M%S}.{kind}"
+        path = os.path.join(folder, name)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", f"{type(exc).__name__}: {exc}")
+            return
+        self.cfg.export_dir = os.path.dirname(os.path.abspath(path))
+        self.cfg.save()
+        self.lbl_live_out.setText(f"已导出：{path}")
+        self.lbl_live_out.setToolTip(path)
+        self._log(f"已导出实时记录：{path}")
+
+    # ------------------------------------------------------------ 音频转文字
+    def _on_trs_pick(self) -> None:
+        from core.transcribe import FILE_FILTER
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择要转写的音频 / 视频", self.cfg.transcribe_dir or "", FILE_FILTER)
+        if not path:
+            return
+        self.cfg.transcribe_dir = os.path.dirname(path)
+        self.cfg.save()
+        self._set_trs_source(path)
+
+    def _set_trs_source(self, path: str) -> None:
+        """换源文件时清掉上一次结果：别让旧文本被导出成新文件的字幕。"""
+        self._trs_path = path
+        self._trs_segments = []
+        self.lbl_trs_file.setText(os.path.basename(path))
+        self.lbl_trs_file.setToolTip(path)
+        self.lbl_trs_out.setText(f"导出目录：{os.path.dirname(path)}")
+        self.txt_trs_result.clear()
+        self.bar_trs.setValue(0)
+        self.btn_trs_txt.setEnabled(False)
+        self.btn_trs_srt.setEnabled(False)
+        self.lbl_trs_state.setText("已选择文件，点「开始转写」。")
+
+    def _on_trs_start(self) -> None:
+        if not self._trs_path:
+            QMessageBox.information(self, "音频转文字", "先点「选择文件…」选一个音频或视频文件。")
+            return
+        if self._running:
+            QMessageBox.information(
+                self, "音频转文字",
+                "实时字幕正在运行。两者共用同一份识别模型，"
+                "先点顶部「停止翻译」，再回来转写。")
+            return
+        self.txt_trs_result.clear()
+        self._trs_segments = []
+        self.btn_trs_txt.setEnabled(False)
+        self.btn_trs_srt.setEnabled(False)
+        self.bar_trs.setValue(0)
+        self.set_transcribing(True)
+        self.lbl_trs_state.setText("正在准备模型…")
+        self.ctrl.transcribe_start(self._trs_path)
+
+    def _on_trs_cancel(self) -> None:
+        self.ctrl.transcribe_cancel()
+
+    def _on_trs_progress(self, pct: int) -> None:
+        self.bar_trs.setValue(int(pct))
+
+    def _on_trs_status(self, text: str) -> None:
+        self.lbl_trs_state.setText(text)
+
+    def _on_trs_done(self, payload) -> None:
+        from core.transcribe import format_ts
+        segments, total, cancelled = payload
+        self._trs_segments = list(segments)
+        self.set_transcribing(False)
+        if not segments:
+            self.lbl_trs_state.setText(
+                "已取消，未转出内容。" if cancelled else
+                "没有识别出文字：确认文件里有人声，或换更大的模型再试。")
+            return
+        self.bar_trs.setValue(100)
+        # 长音频可能上万句：预览截断，导出始终是完整内容
+        lines = [f"[{format_ts(a)} → {format_ts(b)}] {t}" for a, b, t in segments]
+        shown = lines[:400]
+        text = "\n".join(shown)
+        if len(lines) > len(shown):
+            text += f"\n…（共 {len(lines)} 句，预览只显示前 {len(shown)} 句，导出为完整内容）"
+        self.txt_trs_result.setPlainText(text)
+        self.btn_trs_txt.setEnabled(True)
+        self.btn_trs_srt.setEnabled(True)
+        if cancelled:
+            self.lbl_trs_state.setText(
+                f"已取消：保留已转出的 {len(segments)} 句，仍可导出 TXT / SRT。")
+        else:
+            self.lbl_trs_state.setText(
+                f"完成：{len(segments)} 句 · 音频时长 {format_ts(total)}；可导出 TXT / SRT。")
+
+    def _on_trs_fail(self, msg: str) -> None:
+        self.set_transcribing(False)
+        self.lbl_trs_state.setText(msg)
+        QMessageBox.warning(self, "音频转文字", msg)
+
+    def _export_trs(self, kind: str) -> None:
+        if not self._trs_segments:
+            return
+        from core.transcribe import to_srt, to_txt
+        base = os.path.splitext(self._trs_path)[0] or "转写结果"
+        filt = "TXT (*.txt)" if kind == "txt" else "SRT (*.srt)"
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"导出 {kind.upper()}", f"{base}.{kind}", filt)
+        if not path:
+            return
+        data = to_txt(self._trs_segments) if kind == "txt" else to_srt(self._trs_segments)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", f"{type(exc).__name__}: {exc}")
+            return
+        self.lbl_trs_state.setText(f"已导出：{path}")
+        self._log(f"已导出转写结果：{path}")
+
+    def set_transcribing(self, busy: bool) -> None:
+        """转写期间锁住「开始翻译 / 换模型 / 下载卸载」，避免两份任务抢同一份模型。"""
+        self._transcribing = busy
+        self.btn_trs_start.setEnabled(not busy)
+        self.btn_trs_cancel.setEnabled(busy)
+        self.btn_trs_pick.setEnabled(not busy)
+        self.btn_start.setEnabled(not busy)
+        self.cmb_model.setEnabled(not busy and not self._running)
+        self.cmb_dev.setEnabled(not busy and not self._running)
+        self._refresh_models()
+
     def set_running(self, running: bool, paused: bool = False) -> None:
+        if running:
+            if self._live_t0 is None:
+                self._live_t0 = time.monotonic()
+        elif self._live_t0 is not None:
+            # 停止：末句结束时间取停止时刻；只有原文、没有译文的句子原样留在记录里
+            self._live_frozen = self._live_origin + (time.monotonic() - self._live_t0)
+            self._live_t0 = None
+            self._live_seal_prev(self._live_frozen)
+            self._live_open.clear()
+            self._live_origin = self._live_frozen
+            self._live_render()
         self.btn_start.setText("停止翻译" if running else "开始翻译")
         # 动态属性 + 重新 polish：让 QSS 里 [running="true"] 那套配色生效
         self.btn_start.setProperty("running", "true" if running else "false")
@@ -803,8 +1305,10 @@ class ControlPanel(QWidget):
         self.btn_start.style().polish(self.btn_start)
         self.btn_pause.setText("继续" if paused else "暂停")
         self.btn_pause.setEnabled(running)
-        self.cmb_model.setEnabled(not running)
-        self.cmb_dev.setEnabled(not running)
+        # 互斥：运行中不能开转写；转写中「开始翻译」已由 set_transcribing 关掉
+        self.cmb_model.setEnabled(not running and not self._transcribing)
+        self.cmb_dev.setEnabled(not running and not self._transcribing)
+        self.btn_trs_start.setEnabled(not running and not self._transcribing)
         # 运行中不让动模型缓存：换/删文件会让正在跑的识别器失去模型
         self._running = running
         self._refresh_models()

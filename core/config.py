@@ -96,6 +96,10 @@ class AppConfig:
     enable_en_route: bool = True
     # 上次实际用通的翻译通道，下次启动直接复用，省去挨个试错的等待
     last_channel: str = ""
+    # 音频转文字：上次选文件的目录，下次打开对话框直接落在这里
+    transcribe_dir: str = ""
+    # 实时记录导出目录：留空时导出到「文档」，成功后自动记住
+    export_dir: str = ""
     # 音频预处理：轻量谱减法降噪，压低稳态背景噪声（风扇/电流声/低频隆隆）。
     # 对 BGM 这类非稳态音乐帮助有限（那需要人声分离模型），但能改善整体信噪比。
     enable_denoise: bool = True
@@ -173,6 +177,7 @@ class AppConfig:
         "model_size", "asr_device", "compute_type", "source_lang", "channel", "target_lang",
         "custom_type", "custom_key", "custom_base", "custom_model", "caiyun_token",
         "last_channel", "word_map", "name_roster", "proxy", "context_glossary",
+        "transcribe_dir", "export_dir",
     )
 
     def _sanitize(self) -> None:

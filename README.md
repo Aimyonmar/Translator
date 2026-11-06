@@ -181,6 +181,8 @@ Translator/
     pipeline.py         采集→识别→翻译 三线程流水线
     config.py           配置读写
     context.py          语境缓冲、同音词纠正、术语表拼装
+    model_store.py      识别模型缓存状态 / 下载 / 卸载
+    transcribe.py       本地音视频文件转写、TXT / SRT 导出
   ui/
     overlay.py          悬浮字幕窗（自绘描边文字、可拖动）
     panel.py            控制面板

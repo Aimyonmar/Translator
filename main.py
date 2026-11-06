@@ -106,6 +106,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.audio import list_capture_devices, pick_default_device
 from core.config import AppConfig
 from core.pipeline import Pipeline
+from core.transcribe import transcribe_media
 from ui.overlay import SubtitleOverlay
 from ui.panel import ControlPanel, _icon
 
@@ -114,6 +115,8 @@ class AppController:
     def __init__(self, app: QApplication):
         self.app = app
         self._quitting = False          # 退出收尾只跑一次（面板关闭/托盘退出可能同时触发）
+        self._trs_busy = False          # 音频转文字进行中：与实时字幕互斥
+        self._trs_cancel = threading.Event()
         self.cfg = AppConfig.load()
         self.pipeline = Pipeline(self.cfg)
         self.overlay = SubtitleOverlay(self.cfg)
@@ -185,11 +188,14 @@ class AppController:
     def on_partial(self, seq: int, src: str) -> None:
         """识别先出结果：字幕立刻动起来，译文随后补上。"""
         self.overlay.sig_src.emit(seq, src)
+        # 同一出口补发实时记录信号：原文上屏时刻就是该句的起始时间
+        self.panel.sig_live_partial.emit(seq, src)
         if src:
             self.panel.sig_log.emit(f"JA  {src}")
 
     def on_result(self, seq: int, src: str, tgt: str) -> None:
         self.overlay.sig_tgt.emit(seq, tgt)
+        self.panel.sig_live_line.emit(seq, src, tgt)
         if tgt:
             self.panel.sig_log.emit(f"ZH  {tgt}")
 
@@ -337,7 +343,60 @@ class AppController:
             self.status(f"翻译测试：{out or '失败（请检查网络或换通道）'}")
         threading.Thread(target=work, daemon=True).start()
 
+    # ------------------------------------------------------------ 音频转文字
+    def transcribe_start(self, path: str) -> None:
+        """整段音视频转文字（后台线程）。
+
+        与实时字幕互斥：两者共用 pipeline.asr 里的那一份模型，同时跑会让解码排队、
+        显存也顶不住；所以运行中拒绝开始，转写中面板会锁住「开始翻译」。
+        """
+        if self.pipeline.state in ("running", "paused", "loading"):
+            self.panel.sig_trs_fail.emit("实时字幕正在运行，先停止翻译再转写。")
+            return
+        if self._trs_busy:
+            return
+        self._trs_busy = True
+        self._trs_cancel = threading.Event()
+        cancel = self._trs_cancel
+
+        def work():
+            asr = self.pipeline.asr
+            try:
+                self.panel.sig_trs_status.emit("正在加载模型…")
+                asr.load(on_progress=self.panel.sig_trs_status.emit)
+                self.status(f"开始转写：{os.path.basename(path)}")
+                namefix = bool(self.cfg.enable_namefix)
+                segments, total = transcribe_media(
+                    asr, path,
+                    # "" / auto 表示让 Whisper 自己判语种
+                    language=(None if self.cfg.source_lang in ("", "auto")
+                              else self.cfg.source_lang),
+                    word_map=self.cfg.word_map if namefix else "",
+                    roster=self.cfg.name_roster if namefix else "",
+                    on_progress=self.panel.sig_trs_progress.emit,
+                    should_stop=cancel.is_set,
+                )
+                self.panel.sig_trs_done.emit((segments, total, cancel.is_set()))
+                if cancel.is_set():
+                    self.status(f"已取消转写（保留 {len(segments)} 句）")
+                else:
+                    self.status(f"转写完成：{len(segments)} 句")
+            except Exception as exc:
+                self.panel.sig_trs_fail.emit(f"转写失败：{type(exc).__name__}: {exc}")
+            finally:
+                self._trs_busy = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def transcribe_cancel(self) -> None:
+        if self._trs_busy:
+            self._trs_cancel.set()
+            self.panel.sig_trs_status.emit("正在取消…（当前这句转完就停）")
+
     def toggle_start(self) -> None:
+        if self._trs_busy:
+            self.status("正在转写文件，先点「转写」页的「取消」再开始实时翻译")
+            return
         if self.pipeline.state in ("running", "paused", "loading"):
             self.pipeline.stop()
             self.panel.set_running(False)
