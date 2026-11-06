@@ -78,12 +78,18 @@ class AudioDevice:
     def from_dict(d: Dict) -> Optional["AudioDevice"]:
         if not d:
             return None
-        return AudioDevice(
-            index=d.get("index"), name=d.get("name", ""), api=d.get("api", ""),
-            kind=d.get("kind", "input"), samplerate=int(d.get("samplerate") or TARGET_SR),
-            channels=int(d.get("channels") or 2), backend=d.get("backend", "sounddevice"),
-            is_default=bool(d.get("is_default", False)),
-        )
+        # 配置来自可手改的 JSON：类型/取值坏掉时返回 None 回落到默认设备，
+        # 而不是让 int("48k") 把启动流程带崩
+        try:
+            return AudioDevice(
+                index=d.get("index"), name=str(d.get("name", "")), api=str(d.get("api", "")),
+                kind=str(d.get("kind", "input")),
+                samplerate=int(d.get("samplerate") or TARGET_SR),
+                channels=int(d.get("channels") or 2), backend=str(d.get("backend", "sounddevice")),
+                is_default=bool(d.get("is_default", False)),
+            )
+        except (TypeError, ValueError):
+            return None
 
 
 def _sd_devices() -> List[AudioDevice]:
@@ -139,12 +145,24 @@ def _pw_devices() -> List[AudioDevice]:
             default_name = p.get_default_output_device_info().get("name", "") or ""
         except Exception:
             pass
+        # pyaudiowpatch 直接给了「当前默认输出对应的回环设备」。优先按 index 打星标：
+        # 蓝牙耳机有「免提/立体声」两个 profile，名字相近，纯按名字匹配容易认错，
+        # 认错就会默认去抓扬声器回环 —— 声音从耳机出，采集端一个字都没有。
+        default_idx = None
+        try:
+            default_idx = int(p.get_default_wasapi_loopback().get("index"))
+        except Exception:
+            default_idx = None
         for d in p.get_loopback_device_info_generator():
             name = d.get("name", "") or ""
+            idx = int(d.get("index"))
             base = name.replace("[Loopback]", "").strip()
-            is_def = bool(default_name) and (base in default_name or default_name in base)
+            if default_idx is not None:
+                is_def = idx == default_idx
+            else:
+                is_def = bool(default_name) and (base in default_name or default_name in base)
             out.append(AudioDevice(
-                index=int(d.get("index")), name=name, api="WASAPI",
+                index=idx, name=name, api="WASAPI",
                 kind="loopback", samplerate=int(d.get("defaultSampleRate") or 48000),
                 channels=min(2, int(d.get("maxInputChannels") or 2)),
                 backend="pyaudiowpatch", is_default=is_def,
@@ -244,17 +262,25 @@ class AudioCapture:
         th = self._thread
         if th is not None and th.is_alive():
             th.join(timeout=2.0)
-        # 线程已把流关掉（正常路径）。异常残留（线程死在半路）才由本线程兜底关一次。
-        st, self._stream = self._stream, None
-        if st is not None:
-            try:
-                st.stop_stream()
-            except Exception:
-                pass
-            try:
-                st.close()
-            except Exception:
-                pass
+        # 只有确认采集线程已经退出，才由本线程兜底关流。
+        # 若 2 秒后线程仍活着，说明它卡在设备/PortAudio 调用里，此时从别的线程
+        # close 正是上面注释要规避的 0xc0000005 竞态；宁可让持有线程自己的
+        # finally 收尾（哪怕晚一点），也不能拿整个进程去赌。
+        timed_out = th is not None and th.is_alive()
+        if timed_out:
+            self.error = self.error or "采集线程未在 2 秒内退出，已跳过跨线程关流以免崩溃"
+            self._stream = None
+        else:
+            st, self._stream = self._stream, None
+            if st is not None:
+                try:
+                    st.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    st.close()
+                except Exception:
+                    pass
         self._thread = None
         # 不调用 PyAudio.terminate()：pyaudiowpatch 在部分环境下 terminate 会直接崩进程，
         # PyAudio 实例改为全局复用，随进程退出自然释放。
