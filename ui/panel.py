@@ -4,16 +4,18 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel, QComboBox,
     QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox, QPlainTextEdit,
-    QProgressBar, QMessageBox, QLineEdit,
+    QProgressBar, QMessageBox, QLineEdit, QScrollArea, QFrame, QApplication,
+    QAbstractSpinBox,
 )
 
 from core.asr import MODEL_SIZES
 from core.translator import CHANNELS, CHANNEL_NAMES, LANGS
+from ui import theme
 
 
 def _icon() -> QIcon:
@@ -36,6 +38,12 @@ class ControlPanel(QWidget):
     sig_level = Signal(float)
     sig_log = Signal(str)
     sig_channel_result = Signal(str)
+    # 工作线程（设备枚举/代理探测）不能直接碰控件，统一用信号投递回主线程
+    sig_devices = Signal(list, object)
+    sig_proxy_text = Signal(str)
+    # 运行状态也走信号：流水线在后台线程里把 state 改成 error/stopped 时，
+    # 按钮文字必须跟着变回「开始翻译」，不能只靠 toggle_start 那一次同步
+    sig_running = Signal(bool, bool)
 
     def __init__(self, cfg, controller):
         super().__init__()
@@ -49,24 +57,60 @@ class ControlPanel(QWidget):
         self.sig_log.connect(self._log)
         self.sig_channel_result.connect(self._show_channel_result)
         self._build()
+        # 必须放在 _build() 之后：txt_proxy 等控件是在 _build() 里创建的
+        self.sig_devices.connect(self.set_devices)
+        self.sig_proxy_text.connect(self.txt_proxy.setText)
+        self.sig_running.connect(self.set_running)
+        self._apply_default_size()
+        # 滚轮防误触：整窗统一过滤，滑过下拉框/数值框时先滚页面（见 eventFilter）
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     # ------------------------------------------------------------ UI
     def _build(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(10)
+        # 外层只放「可滚动内容 + 固定底栏」：窗口再矮，开始/暂停/隐藏字幕也点得到
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        content = QWidget()
+        content.setObjectName("scrollContent")
+        self._content = content
+        root = QVBoxLayout(content)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
+        # 标题区：一眼看清「这是什么 + 链路怎么走」，比直接堆表单更有层次
+        head = QVBoxLayout()
+        head.setSpacing(2)
+        lbl_title = QLabel("VTuber 实时翻译器")
+        lbl_title.setObjectName("appTitle")
+        lbl_sub = QLabel("系统声音 → 语音识别 → 翻译 → 悬浮字幕")
+        lbl_sub.setObjectName("appSubtitle")
+        head.addWidget(lbl_title)
+        head.addWidget(lbl_sub)
+        root.addLayout(head)
 
         # 状态
         box_state = QGroupBox("运行状态")
         h = QHBoxLayout(box_state)
         self.lbl_state = QLabel("未启动")
-        self.lbl_state.setStyleSheet("font-weight:bold;font-size:14px;color:#5ec8ff;")
+        self.lbl_state.setObjectName("stateValue")
         self.bar = QProgressBar()
         self.bar.setRange(0, 100)
         self.bar.setFixedWidth(150)
         self.bar.setTextVisible(False)
+        lbl_vol = QLabel("音量")
+        lbl_vol.setObjectName("hint")
         h.addWidget(self.lbl_state, 1)
-        h.addWidget(QLabel("音量"))
+        h.addWidget(lbl_vol)
         h.addWidget(self.bar)
         root.addWidget(box_state)
 
@@ -279,6 +323,75 @@ class ControlPanel(QWidget):
         f.addRow("", self.txt_health)
         root.addWidget(box_tr)
 
+        # 语境辅助（设计见 docs/语境翻译设计.md）：三个开关 + 前文条数 + 术语表。
+        # 全部改动即存，运行时每句都重新读 cfg，不需要重启，也不需要通知控制器。
+        box_ctx = QGroupBox("语境辅助（减少指代/同音词误译）")
+        f = QFormLayout(box_ctx)
+        self.chk_context = QCheckBox("翻译参考前文")
+        self.chk_context.setChecked(bool(self.cfg.enable_context))
+        self.chk_context.setToolTip(
+            "把最近几条「原文→译文」交给自定义 LLM 通道，帮助消解省略主语、指代和一词多义。\n"
+            "只对填了 API 的自定义通道生效：免费通道没有上下文参数，单句翻译。\n"
+            "关闭后翻译层完全不注入上下文，行为与加这个功能之前一致。\n"
+            "前文只来自本次运行已上屏的句子，重新「开始翻译」会清空。")
+        self.sp_ctx = QSpinBox()
+        self.sp_ctx.setRange(0, 8)
+        self.sp_ctx.setValue(int(self.cfg.context_window))
+        self.sp_ctx.setToolTip(
+            "带几条前文（0~8，默认 3）。0 等同关闭。\n"
+            "越多越能消歧，但提示词更长，LLM 通道会稍慢一点（每条约几十字，延迟增量很小）。")
+        self.chk_homophone = QCheckBox("识别同音词纠正")
+        self.chk_homophone.setChecked(bool(self.cfg.enable_homophone_fix))
+        self.chk_homophone.setToolTip(
+            "识别层按上下文线索改掉日语同音误听：変身→返信、対照→対象。\n"
+            "只在有把握时改（整句只剩该词、无上下文线索都不动），每次改动会在日志里注明。\n"
+            "发现改错就关掉，识别结果原样送出。")
+        self.chk_free = QCheckBox("免费通道也带语境（试验）")
+        self.chk_free.setChecked(bool(self.cfg.enable_free_context))
+        self.chk_free.setToolTip(
+            "默认关闭。开启后把上一句原文（最多 60 字）用换行拼在当前句前面一起送翻，\n"
+            "再按换行把当前句那段切出来。\n"
+            "代价与风险：每次请求多带几十字（延迟略增）；个别通道会把两句合成一段，\n"
+            "程序会检测到并改用单句重发一次，仍拿不到干净译文就只显示原文。\n"
+            "收益有限：字幕本身做不到跨句一致，只对这一句的主语/指代有帮助，可自行对比。")
+        row_ctx = QHBoxLayout()
+        row_ctx.addWidget(self.chk_context)
+        row_ctx.addSpacing(12)
+        row_ctx.addWidget(QLabel("前文条数"))
+        row_ctx.addWidget(self.sp_ctx)
+        row_ctx.addStretch(1)
+        f.addRow("", row_ctx)
+        f.addRow("", self.chk_homophone)
+        f.addRow("", self.chk_free)
+        self.txt_glossary = QPlainTextEdit()
+        self.txt_glossary.setPlainText(self.cfg.context_glossary or "")
+        self.txt_glossary.setPlaceholderText(
+            "一行一条「原词=译法」\n例：返信=回复\nホロライブ=Hololive\n配信=直播")
+        self.txt_glossary.setFixedHeight(64)
+        self.txt_glossary.setToolTip(
+            "术语表：当前句出现「原词」时，按这里的「译法」翻。\n"
+            "只对自定义 LLM 通道生效（免费通道无法强制术语）；写错不会报错，只是不生效。\n"
+            "输入停顿 0.6 秒自动保存。")
+        f.addRow("术语表", self.txt_glossary)
+        lbl_ctx_hint = QLabel("以上只影响翻译与识别，不改动音频链路；术语表仅自定义 LLM 通道生效。")
+        lbl_ctx_hint.setObjectName("hint")
+        lbl_ctx_hint.setWordWrap(True)
+        f.addRow("", lbl_ctx_hint)
+        # 术语表逐字写盘太浪费：停顿 600ms 后一次性保存（定时器在 GUI 线程，单次触发）
+        self._glossary_timer = QTimer(self)
+        self._glossary_timer.setSingleShot(True)
+        self._glossary_timer.setInterval(600)
+        self._glossary_timer.timeout.connect(self._on_glossary)
+        self.chk_context.stateChanged.connect(self._on_context_toggle)
+        self.chk_homophone.stateChanged.connect(self._on_context_toggle)
+        self.chk_free.stateChanged.connect(self._on_context_toggle)
+        self.sp_ctx.valueChanged.connect(self._on_context_toggle)
+        self.txt_glossary.textChanged.connect(self._on_glossary_changed)
+        # 前文条数/免费语境都依赖「翻译参考前文」：关掉时没有任何前文可拼
+        self.sp_ctx.setEnabled(self.chk_context.isChecked())
+        self.chk_free.setEnabled(self.chk_context.isChecked())
+        root.addWidget(box_ctx)
+
         # 断句
         box_vad = QGroupBox("断句灵敏度")
         f = QFormLayout(box_vad)
@@ -298,7 +411,7 @@ class ControlPanel(QWidget):
         # 实时诊断：直接显示「当前音量 vs 触发线」，不出字幕时一眼能看出卡在哪
         self.lbl_diag = QLabel("点「开始翻译」后，这里显示实时音量与触发线")
         self.lbl_diag.setWordWrap(True)
-        self.lbl_diag.setStyleSheet("color:#888; font-size:11px;")
+        self.lbl_diag.setObjectName("hint")
         f.addRow("", self.lbl_diag)
         self.sp_silence = QSpinBox()
         self.sp_silence.setRange(150, 2000)
@@ -360,33 +473,65 @@ class ControlPanel(QWidget):
         f.addRow("", row7)
         root.addWidget(box_sub)
 
-        # 按钮
-        row8 = QHBoxLayout()
+        self.log = QPlainTextEdit()
+        self.log.setObjectName("console")
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(300)
+        self.log.setFixedHeight(150)
+        # 显式给文档设字体：只靠 QSS 定字号时，文档行高与绘制字体对不上，多行会挤在一起
+        self.log.setFont(QFont("Microsoft YaHei UI", 10))
+        self.log.document().setDefaultFont(self.log.font())
+        root.addWidget(self.log)
+
+        tip = QLabel("提示：字幕窗可用鼠标拖动，右下角拖动改宽度，右键可调字号/背景/穿透。")
+        tip.setObjectName("hint")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+        root.addStretch(1)
+
+        self.scroll.setWidget(content)
+        outer.addWidget(self.scroll, 1)
+
+        # 固定底栏：三个操作按钮不随内容滚走，窗口压到最小也始终可见
+        footer = QWidget()
+        footer.setObjectName("footer")
+        self._footer = footer
+        row8 = QHBoxLayout(footer)
+        row8.setContentsMargins(18, 10, 18, 12)
+        row8.setSpacing(10)
         self.btn_start = QPushButton("开始翻译")
-        self.btn_start.setFixedHeight(38)
+        # 主操作只在视觉上突出：运行中换成警示色，停下来的动作一眼可见
+        self.btn_start.setObjectName("primary")
+        self.btn_start.setFixedHeight(40)
         self.btn_start.clicked.connect(self.ctrl.toggle_start)
         self.btn_pause = QPushButton("暂停")
-        self.btn_pause.setFixedHeight(38)
+        self.btn_pause.setFixedHeight(40)
         self.btn_pause.clicked.connect(self.ctrl.toggle_pause)
         self.btn_sub = QPushButton("隐藏字幕")
-        self.btn_sub.setFixedHeight(38)
+        self.btn_sub.setFixedHeight(40)
         self.btn_sub.clicked.connect(self.ctrl.toggle_subtitle)
         row8.addWidget(self.btn_start, 2)
         row8.addWidget(self.btn_pause, 1)
         row8.addWidget(self.btn_sub, 1)
-        root.addLayout(row8)
+        outer.addWidget(footer)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(300)
-        self.log.setFixedHeight(150)
-        self.log.setStyleSheet("background:#101318;color:#c8d0dc;font-family:Consolas;")
-        root.addWidget(self.log)
+        # 统一样式在最后一次性套上：控件都建好了，QSS 才能一次覆盖全部
+        theme.apply(self)
 
-        tip = QLabel("提示：字幕窗可用鼠标拖动，右下角拖动改宽度，右键可调字号/背景/穿透。")
-        tip.setStyleSheet("color:#8892a4;")
-        tip.setWordWrap(True)
-        root.addWidget(tip)
+    def _apply_default_size(self) -> None:
+        """默认窗口大小：内容放得下就按内容，放不下就贴到屏幕可用区域。
+
+        以前窗口直接按内容 sizeHint 展开（约 1440px 高），1080p 屏幕上底部按钮
+        会跑到屏幕外；现在最小尺寸由滚动区接管，默认尺寸再夹到可用区域以内。
+        """
+        hint = self._content.sizeHint()
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        max_w = (avail.width() - 80) if avail else 1280
+        max_h = (avail.height() - 80) if avail else 680
+        w = max(720, min(hint.width(), max_w))
+        h = max(520, min(hint.height() + self._footer.sizeHint().height() + 8, max_h))
+        self.resize(w, h)
 
     # ------------------------------------------------------------ 回调
     def _on_device_changed(self, idx: int) -> None:
@@ -426,6 +571,25 @@ class ControlPanel(QWidget):
         self.cfg.vocal_strength = float(self.sp_vocal.value())
         self.cfg.save()
         self.ctrl.on_vocal_changed()
+
+    def _on_context_toggle(self, *_a) -> None:
+        # 四个字段一起写：它们都只被「每句重读 cfg」的翻译/识别层使用，
+        # 不需要通知控制器，也不跨线程碰控件
+        self.cfg.enable_context = self.chk_context.isChecked()
+        self.cfg.enable_homophone_fix = self.chk_homophone.isChecked()
+        self.cfg.enable_free_context = self.chk_free.isChecked()
+        self.cfg.context_window = int(self.sp_ctx.value())
+        self.sp_ctx.setEnabled(self.chk_context.isChecked())
+        self.chk_free.setEnabled(self.chk_context.isChecked())
+        self.cfg.save()
+
+    def _on_glossary_changed(self) -> None:
+        # 逐字保存会很频繁：停手 600ms 再落盘
+        self._glossary_timer.start()
+
+    def _on_glossary(self) -> None:
+        self.cfg.context_glossary = self.txt_glossary.toPlainText().strip()
+        self.cfg.save()
 
     def _on_health_click(self) -> None:
         self.btn_health.setEnabled(False)
@@ -473,11 +637,13 @@ class ControlPanel(QWidget):
         self.cfg.sensitivity = round(v / 100.0, 2)
         self.lbl_sens.setText(f"{self.cfg.sensitivity:.2f}")
         self.ctrl.on_vad_changed()
+        self.cfg.save()
 
     def _on_vad(self, *_a) -> None:
         self.cfg.min_silence_ms = int(self.sp_silence.value())
         self.cfg.max_speech_ms = int(self.sp_max.value())
         self.ctrl.on_vad_changed()
+        self.cfg.save()
 
     def _on_bg(self, v: int) -> None:
         self.cfg.opacity = round(v / 100.0, 2)
@@ -485,7 +651,8 @@ class ControlPanel(QWidget):
 
     def _on_style(self, *_a) -> None:
         self.cfg.font_size = int(self.sp_font.value())
-        self.cfg.source_font_size = max(9, int(self.sp_font.value()) - 10)
+        # 原文（副行）字号只由主字号派生，面板这个入口是唯一来源
+        self.cfg.source_font_size = theme.source_font_size(self.cfg.font_size)
         self.cfg.show_source = self.chk_src.isChecked()
         self.cfg.max_lines = int(self.sp_lines.value())
         self.cfg.auto_clear_sec = float(self.sp_clear.value())
@@ -505,6 +672,10 @@ class ControlPanel(QWidget):
 
     def set_running(self, running: bool, paused: bool = False) -> None:
         self.btn_start.setText("停止翻译" if running else "开始翻译")
+        # 动态属性 + 重新 polish：让 QSS 里 [running="true"] 那套配色生效
+        self.btn_start.setProperty("running", "true" if running else "false")
+        self.btn_start.style().unpolish(self.btn_start)
+        self.btn_start.style().polish(self.btn_start)
         self.btn_pause.setText("继续" if paused else "暂停")
         self.btn_pause.setEnabled(running)
         self.cmb_model.setEnabled(not running)
@@ -525,7 +696,7 @@ class ControlPanel(QWidget):
         if float(getattr(self.cfg, "sensitivity", 0.7) or 0) > 0.92:
             self.lbl_diag.setText("灵敏度接近拉满：背景音乐会被一直算作语音，句子切不开，"
                                   "字幕要等好几秒才出。建议调回 0.7 左右。")
-            self.lbl_diag.setStyleSheet("color:#c62828; font-size:11px;")
+            self.lbl_diag.setStyleSheet(f"color:{theme.DANGER}; font-size:11px;")
             return
         try:
             vad = self.ctrl.pipeline.vad
@@ -537,14 +708,14 @@ class ControlPanel(QWidget):
             return
         if lv < 0.0015:
             txt = f"音量 {lv:.4f} —— 几乎没声音，检查采集设备是不是选错了"
-            color = "#c62828"
+            color = theme.DANGER
         elif lv > th:
             txt = f"音量 {lv:.4f} > 触发线 {th:.4f} —— 正常，正在送去识别"
-            color = "#2e7d32"
+            color = theme.OK
         else:
             txt = (f"音量 {lv:.4f} < 触发线 {th:.4f} —— 音量没到触发线，"
                    f"请把灵敏度调高（或调大播放器音量）")
-            color = "#c62828"
+            color = theme.DANGER
         self.lbl_diag.setText(txt)
         self.lbl_diag.setStyleSheet(f"color:{color}; font-size:11px;")
 
@@ -553,7 +724,36 @@ class ControlPanel(QWidget):
         sb = self.log.verticalScrollBar()
         sb.setValue(sb.maximum())
 
+    def eventFilter(self, obj, ev):
+        """统一拦截取值控件的滚轮：没焦点时让给页面滚动。
+
+        面板里 QComboBox / QSpinBox / QDoubleSpinBox / QSlider 很多，逐个装过滤器
+        容易漏、以后新加控件还会忘，所以在 QApplication 上统一过滤：
+        - 控件自己拿到焦点（用户先点过它）→ 放行，滚轮照旧调值；
+        - 没焦点 → 把滚轮事件转给滚动区 viewport，页面按原生手感滚动，值不变。
+        只拦 Wheel：键盘上下键、拖动滑块走 keyPress/mouseMove，不受影响。
+        """
+        if ev.type() == QEvent.Wheel and hasattr(self, "scroll"):
+            w = obj
+            # 数值框内部可能是 QLineEdit，往上找一两层认领控件
+            for _ in range(3):
+                if isinstance(w, (QComboBox, QAbstractSpinBox, QSlider)):
+                    if w.hasFocus():
+                        break
+                    QApplication.sendEvent(self.scroll.viewport(), ev)
+                    return True
+                w = w.parentWidget() if hasattr(w, "parentWidget") else None
+                if w is None:
+                    break
+        return super().eventFilter(obj, ev)
+
     def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        self.ctrl.on_panel_hidden()
+        # 关闭主窗口 = 真正退出程序，不再「最小化到托盘」。
+        # 以前 ignore()+hide() 会让进程留在后台、字幕窗继续挂在桌面上，
+        # 单实例锁也一直被占着，再双击只会提示「已经在运行」。收尾交给控制器。
+        # 术语表是延迟保存：退出前把还没落盘的那一次补上，别让刚打的字丢掉
+        if self._glossary_timer.isActive():
+            self._glossary_timer.stop()
+            self._on_glossary()
+        event.accept()
+        self.ctrl.quit()

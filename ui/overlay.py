@@ -7,30 +7,41 @@ from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt, Signal, QPoint, QRect, QTimer, QSize
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QPainter, QPainterPath,
-                           QPen, QBrush, QCursor, QAction)
+                           QPen, QBrush, QCursor, QAction, QLinearGradient)
 from PySide6.QtWidgets import QWidget, QMenu, QApplication
+
+from ui import theme
 
 FONT_FAMILY = "Microsoft YaHei UI"
 
+# 中文禁则：行首不能是收尾标点，行尾不能是开括号（否则读起来像断错气）
+_NO_LINE_START = "、。，,．.!?！？：；:;）)］]｝}」』】〉》”’…—ー~～%°"
+_NO_LINE_END = "（(［[｛{「『【〈《“‘"
+
 
 def wrap_text(fm: QFontMetrics, text: str, max_w: int) -> List[str]:
-    """按字符断行，CJK 友好；英文尽量在空格处断。"""
+    """按字符断行，CJK 友好；英文尽量在空格处断，并做简单的中文禁则处理。"""
     lines: List[str] = []
     cur = ""
-    last_space = -1
     for ch in text:
-        if ch == " ":
-            last_space = len(cur)
-        test = cur + ch
-        if fm.horizontalAdvance(test) > max_w and cur:
+        over = cur and fm.horizontalAdvance(cur + ch) > max_w
+        # 收尾标点宁可让上一行略微超宽，也不要它孤零零出现在行首
+        if over and ch not in _NO_LINE_START:
             cut = len(cur)
-            if last_space > 0 and last_space < len(cur):
-                cut = last_space + 1
-            lines.append(cur[:cut].rstrip())
-            cur = cur[cut:].lstrip() + ch
-            last_space = -1
+            sp = cur.rfind(" ")
+            if sp > 0:
+                cut = sp + 1
+            head = cur[:cut].rstrip()
+            tail = cur[cut:]
+            # 开括号不能留在行尾：挪到下一行去和后面的内容配对
+            if head and head[-1] in _NO_LINE_END:
+                tail = head[-1] + tail
+                head = head[:-1].rstrip()
+            if head:
+                lines.append(head)
+            cur = tail.lstrip() + ch
         else:
-            cur = test
+            cur += ch
     if cur:
         lines.append(cur)
     return lines
@@ -50,6 +61,14 @@ class SubtitleOverlay(QWidget):
         self._drag_pos: Optional[QPoint] = None
         self._resizing = False
         self._pinned = True
+        # 排版缓存：内容/尺寸/样式没变就不重新断行（以前每次 paintEvent 都重算一遍）
+        self._items: List[Tuple[str, str, int]] = []
+        self._pad = 0
+        self._dirty = True
+        self.font_trans = QFont(FONT_FAMILY)
+        self.font_src = QFont(FONT_FAMILY)
+        self._fm_t = QFontMetrics(self.font_trans)
+        self._fm_s = QFontMetrics(self.font_src)
 
         self.setWindowTitle("实时字幕")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -72,12 +91,21 @@ class SubtitleOverlay(QWidget):
     def apply_config(self) -> None:
         self._apply_fonts()
         self.set_click_through(self.cfg.click_through)
+        self._dirty = True
         self.update()
 
     def _apply_fonts(self) -> None:
-        self.font_trans = QFont(FONT_FAMILY, int(self.cfg.font_size), QFont.Bold)
-        self.font_src = QFont(FONT_FAMILY, int(self.cfg.source_font_size))
+        main = theme.main_font_size(self.cfg.font_size)
+        self.font_trans = QFont(FONT_FAMILY, main, QFont.Bold)
+        # 副行字号只跟主字号走，不再单独读 cfg.source_font_size（避免双入口互相覆盖）
+        self.font_src = QFont(FONT_FAMILY, theme.source_font_size(main))
         self.font_src.setItalic(False)
+        self._fm_t = QFontMetrics(self.font_trans)
+        self._fm_s = QFontMetrics(self.font_src)
+        self._dirty = True
+        # 同步回配置，保证落盘的数值与画面一致
+        self.cfg.font_size = main
+        self.cfg.source_font_size = theme.source_font_size(main)
 
     def _restore_geometry(self) -> None:
         screens = QApplication.screens() or []
@@ -104,7 +132,7 @@ class SubtitleOverlay(QWidget):
             return
         self.lines.append((seq, src, "", time.time()))
         self._trim()
-        self._relayout()
+        self._dirty = True
         self.update()
 
     def _on_tgt(self, seq: int, tgt: str) -> None:
@@ -112,7 +140,7 @@ class SubtitleOverlay(QWidget):
         for i, item in enumerate(self.lines):
             if item[0] == seq:
                 self.lines[i] = (seq, item[1], tgt or "", item[3])
-                self._relayout()
+                self._dirty = True
                 self.update()
                 return
 
@@ -123,7 +151,7 @@ class SubtitleOverlay(QWidget):
 
     def _on_clear(self) -> None:
         self.lines = []
-        self._relayout()
+        self._dirty = True
         self.update()
 
     def _tick(self) -> None:
@@ -131,15 +159,21 @@ class SubtitleOverlay(QWidget):
         if sec > 0 and self.lines:
             if time.time() - self.lines[-1][3] > sec:
                 self.lines = []
-                self._relayout()
+                self._dirty = True
                 self.update()
 
     # ---------------------------------------------------------- 绘制
     def _layout(self, width: int):
-        pad = int(self.cfg.font_size * 0.5) + 8
+        fs = int(self.cfg.font_size)
+        # 内边距跟字号走：字号调大时留白同步变宽，观感不会突然变挤
+        pad = max(18, int(fs * 0.62) + 10)
         inner = max(60, width - pad * 2)
-        fm_t = QFontMetrics(self.font_trans)
-        fm_s = QFontMetrics(self.font_src)
+        fm_t = self._fm_t
+        fm_s = self._fm_s
+        # 行距 ≈ 1.2 倍行高：译文行间留一点呼吸，长段也不糊成一块
+        line_gap = max(4, int(fs * 0.26))
+        src_gap = max(2, int(fs * 0.10))
+        block_gap = max(10, int(fs * 0.55))
         items = []
         y = pad
         show_src = bool(self.cfg.show_source)
@@ -147,39 +181,46 @@ class SubtitleOverlay(QWidget):
             if tgt:
                 for line in wrap_text(fm_t, tgt, inner):
                     items.append(("t", line, y))
-                    y += fm_t.height() + 6
+                    y += fm_t.height() + line_gap
                 if show_src and src:
-                    y += 2
+                    y += src_gap
                     for line in wrap_text(fm_s, src, inner):
                         items.append(("s", line, y))
-                        y += fm_s.height() + 2
-                    y += fm_s.height() * 0.35
+                        y += fm_s.height() + src_gap
+                    y += fm_s.height() * 0.3
             else:
                 # 译文还没到：先用原文占住这一行，等译文到了原地替换
                 for line in wrap_text(fm_t, src, inner):
                     items.append(("p", line, y))
-                    y += fm_t.height() + 6
-            y += 10
-        return items, max(70, int(y + pad - 10)), pad, fm_t, fm_s
+                    y += fm_t.height() + line_gap
+            y += block_gap
+        return items, max(72, int(y + pad - block_gap)), pad, fm_t, fm_s
 
-    def _relayout(self) -> None:
+    def _ensure_layout(self) -> None:
+        """排版只在「内容/尺寸/样式」变过时重算，普通重绘直接复用上次结果。"""
+        if not self._dirty:
+            return
         items, h, pad, fm_t, fm_s = self._layout(self.width())
         self._items = items
         self._pad = pad
+        self._fm_t = fm_t
+        self._fm_s = fm_s
+        self._dirty = False
         if abs(self.height() - h) > 2:
             self.setFixedHeight(h)
+
+    def _relayout(self) -> None:
+        self._dirty = True
+        self._ensure_layout()
 
     def resizeEvent(self, event):
         self.cfg.window_width = self.width()
-        self._relayout()
+        self._dirty = True
+        self._ensure_layout()
         super().resizeEvent(event)
 
     def paintEvent(self, event):
-        items, h, pad, fm_t, fm_s = self._layout(self.width())
-        self._items = items
-        self._pad = pad
-        if abs(self.height() - h) > 2:
-            self.setFixedHeight(h)
+        self._ensure_layout()
 
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -188,31 +229,36 @@ class SubtitleOverlay(QWidget):
         alpha = int(max(0.0, min(1.0, float(self.cfg.opacity))) * 255)
         rect = self.rect().adjusted(2, 2, -2, -2)
         path = QPainterPath()
-        path.addRoundedRect(rect.x(), rect.y(), rect.width(), rect.height(), 14, 14)
-        p.fillPath(path, QBrush(QColor(8, 10, 14, alpha)))
+        path.addRoundedRect(rect.x(), rect.y(), rect.width(), rect.height(), 16, 16)
+        # 上浅下深的极轻渐变 + 1px 冷色描边：贴在任何画面上都不会糊成一块黑板
+        grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        grad.setColorAt(0.0, QColor(16, 20, 28, alpha))
+        grad.setColorAt(1.0, QColor(7, 9, 13, alpha))
+        p.fillPath(path, QBrush(grad))
+        p.strokePath(path, QPen(QColor(255, 255, 255, 22), 1))
 
-        if not items:
-            p.setPen(QColor(190, 198, 210, 190))
+        fs = int(self.cfg.font_size)
+        if not self._items:
+            p.setPen(QColor(154, 167, 184, 210))
             p.setFont(self.font_src)
             p.drawText(rect, Qt.AlignCenter, "等待语音输入…")
             p.end()
             return
 
-        for kind, text, y in items:
+        for kind, text, y in self._items:
             if kind == "t":
-                font, color = self.font_trans, QColor(255, 255, 255, 255)
-                baseline = y + fm_t.ascent()
+                font, color, fm = self.font_trans, QColor(255, 255, 255, 255), self._fm_t
             elif kind == "p":
                 # 译文还在路上：原文先用译文字号显示，颜色压暗一档以示「未翻译」
-                font, color = self.font_trans, QColor(206, 214, 226, 235)
-                baseline = y + fm_t.ascent()
+                font, color, fm = self.font_trans, QColor(212, 223, 237, 232), self._fm_t
             else:
-                font, color = self.font_src, QColor(176, 196, 222, 235)
-                baseline = y + fm_s.ascent()
+                font, color, fm = self.font_src, QColor(150, 178, 205, 230), self._fm_s
+            baseline = y + fm.ascent()
             tp = QPainterPath()
-            tp.addText(pad, baseline, font, text)
-            if kind == "t":
-                p.strokePath(tp, QPen(QColor(0, 0, 0, 235), max(3, self.cfg.font_size // 7),
+            tp.addText(self._pad, baseline, font, text)
+            if kind in ("t", "p"):
+                # 描边只给大字：小字加描边会糊成毛边
+                p.strokePath(tp, QPen(QColor(0, 0, 0, 215), max(3, fs // 8),
                                       Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             p.fillPath(tp, QBrush(color))
 
@@ -261,6 +307,7 @@ class SubtitleOverlay(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        menu.setStyleSheet(theme.menu_stylesheet())
         act_src = QAction("显示日语原文", self)
         act_src.setCheckable(True)
         act_src.setChecked(bool(self.cfg.show_source))
@@ -289,8 +336,8 @@ class SubtitleOverlay(QWidget):
         self.update()
 
     def _bump_font(self, d: int) -> None:
-        self.cfg.font_size = max(12, min(72, int(self.cfg.font_size) + d))
-        self.cfg.source_font_size = max(9, min(48, int(self.cfg.source_font_size) + d))
+        # 只调主字号，原文副行由 _apply_fonts 统一派生（不再两边各加各的）
+        self.cfg.font_size = theme.main_font_size(int(self.cfg.font_size) + d)
         self._apply_fonts()
         self.cfg.save()
         self._relayout()
