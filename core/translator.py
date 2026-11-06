@@ -138,7 +138,10 @@ class Translator:
 
     def _custom_ready(self) -> bool:
         c = self.cfg
-        return bool(getattr(c, "custom_key", "") and getattr(c, "custom_type", "openai"))
+        # 去掉空白再判空：否则手工把 Key 清成 "   " 时会被当成已配置，白占 custom 优先级
+        # （_tr_custom 里也是 strip 后为空就直接返回 None）。
+        key = (getattr(c, "custom_key", "") or "").strip()
+        return bool(key and getattr(c, "custom_type", "openai"))
 
     # ---------------------------------------------------------- 通道
     def _tr_custom(self, text: str, src: str = "ja", context: str = "") -> Optional[str]:
