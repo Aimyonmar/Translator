@@ -28,7 +28,8 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # Windows 默认无权创建符号链接，hub 会留下 0 字节的空模型文件，直接改成复制
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
 
-MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo", "large-v2", "large-v3"]
+MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo",
+               "kotoba-whisper-v2.0", "large-v2", "large-v3"]
 
 
 def _gpu_free_gb() -> Optional[float]:
@@ -116,6 +117,9 @@ class WhisperASR:
     def __init__(self, model_size: str = "small", device: str = "auto",
                  compute_type: str = "auto", language: str = "ja"):
         self.model_size = model_size
+        # kotoba-whisper 是日语专用模型：语言必须锁死 ja，不能跟随自动检测/用户设置，
+        # 否则非日语输入会被强行「翻译成日语」，输出不可预期。
+        self._force_ja = "kotoba" in model_size
         self.device = device
         self.compute_type = compute_type
         self.language = language
@@ -207,11 +211,15 @@ class WhisperASR:
                     # CPU 默认只有 4 个解码线程，实测 small 在 16 线程下 RTF 0.70，
                     # 4 线程是 1.17（追不上实时）。这里按逻辑核数放开，最多 16。
                     threads = min(16, os.cpu_count() or 4) if device == "cpu" else 0
+                    # 自定义仓库的型号（turbo / kotoba）按本地快照目录加载：
+                    # load_ref 会把缓存目录交给 WhisperModel，避免它把简称当非法型号。
+                    from .model_store import load_ref
                     self.model = WhisperModel(
-                        size, device=device, compute_type=ct,
+                        load_ref(size), device=device, compute_type=ct,
                         **({"cpu_threads": threads} if threads else {}))
                     self._smoke()          # 真的跑一次推理，别让"缺 DLL 的 GPU"蒙混过关
                     self.model_size = size
+                    self._force_ja = "kotoba" in size
                     self._loaded_size = size
                     self.dev_info = f"{device}/{ct}" + (f" x{threads}" if threads else "")
                     # 1.2.1 的 WhisperModel.transcribe 并不接受 batch_size，本项目
@@ -240,10 +248,14 @@ class WhisperASR:
         from .model_store import is_downloaded
         return is_downloaded(self.model_size)
 
+    def _lang(self) -> str:
+        """kotoba 等日语专用模型强制 ja；其余沿用配置。"""
+        return "ja" if self._force_ja else self.language
+
     def _smoke(self) -> None:
         """用极短静音跑一次推理：GPU 缺运行库时会在这里就暴露，而不是等到真正识别时。"""
         segs, _ = self.model.transcribe(
-            np.zeros(1600, dtype=np.float32), language=self.language,
+            np.zeros(1600, dtype=np.float32), language=self._lang(),
             beam_size=1, vad_filter=False,
         )
         list(segs)
@@ -321,7 +333,7 @@ class WhisperASR:
                 # batch_size 只在 faster-whisper >= 0.9 才支持；老版本没有这个参数，直接传会
                 # TypeError 导致每句都识别失败。按版本能力决定要不要加（探测一次后缓存）。
                 kwargs = dict(
-                    language=self.language,
+                    language=self._lang(),
                     beam_size=self.beam_size,
                     vad_filter=False,
                     condition_on_previous_text=False,
@@ -335,6 +347,10 @@ class WhisperASR:
                     kwargs["batch_size"] = self.batch_size
                 # 热词：把词表下发给解码器，从「识别源头」提高人名命中率（default 关闭，
                 # 见 config.enable_hotwords；同走 prompt，实测静音不复述但仍有风险）。
+                # kotoba 例外：它是日语蒸馏模型，带 hotwords 时实测会直接返回 0 段
+                # （84 段里有 17 段整句消失），所以对日语专用档一律不下发热词。
+                if self._force_ja:
+                    hotwords = ""
                 if hotwords and _hotwords_supported():
                     kwargs["hotwords"] = hotwords
                 segments, _info = self.model.transcribe(audio, **kwargs)

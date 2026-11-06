@@ -18,6 +18,8 @@ REPO_PREFIX = "models--Systran--faster-whisper-"
 # "large-v3-turbo" 指向的那一份，保证「缓存判定」和「实际加载」看到同一个目录。
 _REPO_OVERRIDES = {
     "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    # 日语专用蒸馏档：官方发布了 CTranslate2 版本，faster-whisper 可直接加载
+    "kotoba-whisper-v2.0": "kotoba-tech/kotoba-whisper-v2.0-faster",
 }
 
 # 首次下载的估算体积（MB），用于在 UI 上先告诉用户要花多少空间
@@ -27,6 +29,7 @@ EST_SIZE_MB = {
     "small": 484,
     "medium": 1530,
     "large-v3-turbo": 1620,
+    "kotoba-whisper-v2.0": 1560,
     "large-v2": 3090,
     "large-v3": 3090,
 }
@@ -43,6 +46,21 @@ def cache_root() -> str:
 
 def repo_id(size: str) -> str:
     return _REPO_OVERRIDES.get(size, f"Systran/faster-whisper-{size}")
+
+
+def is_custom(size: str) -> bool:
+    """是否是不走 Systran 命名的型号（需要按仓库/本地路径加载）。"""
+    return size in _REPO_OVERRIDES
+
+
+def load_ref(size: str) -> str:
+    """给 WhisperModel 用的型号参数。
+
+    自定义型号的名字（如 kotoba-whisper-v2.0）不在 faster-whisper 的内置表里，
+    直接传名字会 ValueError；已下载时改为传快照目录，顺带避免任何联网检查。"""
+    if not is_custom(size):
+        return size
+    return snapshot_dir(size) or repo_id(size)
 
 
 def model_dir(size: str) -> str:
@@ -91,12 +109,12 @@ def size_bytes(size: str) -> int:
 def total_bytes() -> int:
     """所有 Whisper 模型缓存合计占用的字节数。
 
-    不能只匹配 Systran 前缀：turbo 在 mobiuslabsgmbh 名下（见 _REPO_OVERRIDES），
-    按前缀扫会漏算，界面上的「已占用」就偏小。"""
+    不能只匹配 Systran 前缀：turbo 在 mobiuslabsgmbh 名下、kotoba 在 kotoba-tech
+    名下（见 _REPO_OVERRIDES），按前缀扫会漏算，界面上的「已占用」就偏小。"""
     hub = os.path.join(cache_root(), "hub")
     try:
         names = [n for n in os.listdir(hub)
-                 if n.startswith("models--") and "faster-whisper" in n]
+                 if n.startswith("models--") and "whisper" in n.lower()]
     except OSError:
         return 0
     return sum(_path_bytes(os.path.join(hub, n)) for n in names)
