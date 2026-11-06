@@ -19,6 +19,7 @@ from typing import Callable, List, Optional
 
 import requests
 
+from .context import format_context, format_free_context
 from .phrases import is_colloquial, lookup as phrase_lookup
 from .loanwords import apply_loanwords
 from .ja_norm import prepare as ja_prepare
@@ -125,7 +126,7 @@ class Translator:
         return bool(getattr(c, "custom_key", "") and getattr(c, "custom_type", "openai"))
 
     # ---------------------------------------------------------- 通道
-    def _tr_custom(self, text: str, src: str = "ja") -> Optional[str]:
+    def _tr_custom(self, text: str, src: str = "ja", context: str = "") -> Optional[str]:
         c = self.cfg
         kind = getattr(c, "custom_type", "openai")
         key = (getattr(c, "custom_key", "") or "").strip()
@@ -143,12 +144,18 @@ class Translator:
         model = getattr(c, "custom_model", "") or "deepseek-chat"
         tname = LANG_NAME_BY_CODE.get(self.target, self.target)
         src_name = "日语" if src in ("ja", "ja-JP", "japanese") else "英语"
+        sys_text = _SYS_PROMPT.format(target=tname).replace("日语", src_name, 1)
+        if context:
+            # 上下文只作为理解材料：先声明「不要翻译/复述」，再要求只输出当前句，
+            # 防止模型把前几轮一起翻出来（字幕里出现两句话）
+            sys_text += ("\n\n" + context
+                         + "\n只翻译用户消息里的当前句，不要复述或翻译上面的对话，"
+                           "不要补充原文没有的信息。")
         r = self.session.post(
             base + "/chat/completions", timeout=25,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             data=json.dumps({"model": model, "temperature": 0.2, "max_tokens": 400,
-                             "messages": [{"role": "system",
-                                           "content": _SYS_PROMPT.format(target=tname).replace("日语", src_name, 1)},
+                             "messages": [{"role": "system", "content": sys_text},
                                           {"role": "user", "content": text}]}, ensure_ascii=False).encode("utf-8"),
         )
         r.raise_for_status()
@@ -256,14 +263,17 @@ class Translator:
             raise RuntimeError(f"caiyun rc={data.get('rc')}")
         return html.unescape((data.get("target") or [""])[0]).strip()
 
-    def _dispatch(self, ch: str, text: str, src: str = "ja", timeout: float = 4.0) -> Optional[str]:
+    def _dispatch(self, ch: str, text: str, src: str = "ja", timeout: float = 4.0,
+                  context: str = "") -> Optional[str]:
         fn = {"custom": self._tr_custom, "tencent": self._tr_tencent, "caiyun": self._tr_caiyun,
               "edge": self._tr_edge, "google": self._tr_google,
               "deepl": self._tr_deepl, "mymemory": self._tr_mymemory}.get(ch)
         if fn is None:
             return None
         if ch == "custom":
-            return fn(text, src)          # 用户自己配的通道，愿意多等，不受实时预算限制
+            # 用户自己配的通道，愿意多等，不受实时预算限制
+            return fn(text, src, context)
+        # 免费通道没有上下文入口：传了也不用，避免把前文拼进请求
         return fn(text, src, timeout)
 
     def _order(self, text: str = "") -> List[str]:
@@ -281,19 +291,50 @@ class Translator:
         return free
 
     # ---------------------------------------------------------- 对外
-    def translate(self, text: str) -> Optional[str]:
+    def translate(self, text: str, context=()) -> Optional[str]:
+        """翻译一句。context=((原文, 译文), …) 只对自定义 LLM 通道生效。
+
+        上下文为空、开关关闭或没配 API Key 时，走的完全是原来的单句路径。
+        """
         text = (text or "").strip()
         if not text:
             return None
+        # 上下文块在本地拼装（<0.1ms）：只有能接受 system prompt 的 custom 通道用得上
+        ctx_block = ""
+        if context and self.cfg is not None and getattr(self.cfg, "enable_context", True) \
+                and self._custom_ready():
+            try:
+                ctx_block = format_context(
+                    context,
+                    getattr(self.cfg, "context_glossary", "") or "",
+                    int(getattr(self.cfg, "context_window", 3)),
+                )
+            except Exception:
+                ctx_block = ""
+        # 免费通道的语境前缀：独立开关、默认关闭。只取最近一句原文且截到 60 字，
+        # 前缀越短，「整段一起翻/复述」的概率和延迟增量越小。
+        free_ctx = ""
+        if context and getattr(self.cfg, "enable_free_context", False):
+            try:
+                free_ctx = format_free_context(context)
+            except Exception:
+                free_ctx = ""
+        # 带上下文/带前缀的译文与单句译文可能不同，缓存 key 必须区分，避免串味
+        if ctx_block:
+            cache_key = (text, hash(ctx_block))
+        elif free_ctx:
+            cache_key = (text, "free", free_ctx)
+        else:
+            cache_key = text
         # 只在这一小段里持锁：网络请求绝不能放进锁里——
         # 之前整段都锁着，2 路并发翻译实际退化成串行排队，实测单句要等 4.7 秒。
         # 先查本地口语表：命中就是 0ms，且译文是人工校准过的，比任何免费机翻都准
         with self.lock:
-            if text in self._cache:
-                return self._cache[text]
+            if cache_key in self._cache:
+                return self._cache[cache_key]
             hit = phrase_lookup(text)
             if hit:
-                self._cache[text] = hit
+                self._cache[cache_key] = hit
                 self._phrase_hits = getattr(self, "_phrase_hits", 0) + 1
                 if len(self._cache) > 800:
                     self._cache.popitem(last=False)
@@ -321,49 +362,83 @@ class Translator:
             left = deadline - time.time()
             if left <= 0.2:
                 break
+            # 免费通道没有上下文参数：把极短前缀用换行拼在待翻译文本前面，
+            # 再靠换行把当前句那段切出来（custom 通道走 system 上下文，不拼前缀）
+            use_free = bool(free_ctx) and ch != "custom"
+            send = (free_ctx + "\n" + pro) if use_free else pro
             try:
                 # 只剩多少时间就只给多少超时：只在循环开头检查预算是拦不住的，
                 # 单次请求（实测 mymemory 4s + edge 鉴权 3s = 8 秒）会把预算整个冲破
-                out = self._fire(ch, pro, src, timeout=min(4.0, left))
-                if out and out.strip():
-                    out = html.unescape(out.strip())
-                    # 免费通道（尤其 MyMemory 匿名额度）对很短的句子会返回一大串拼凑乱码，
-                    # 比如「こんにちは」→ "penian ferein OU潘托斯所有安卓sofou"。
-                    # 这里绝不能 continue 去试其它通道：edge/google/deepl 都要等满超时，
-                    # 实测会把这句的翻译拖到 12 秒，字幕就彻底跟不上说话了。
-                    # 直接放弃译文，让界面只显示原文。
-                    if self._is_junk(text, out):
-                        return None
-                    # 译文口语化润色（确定性规则、0ms）：免费通道的固定生硬模式
-                    # （伙计们→大家、您→你、想尝试→想试试、半角标点、句尾书面句号）。
-                    # 规则只动词级与标点，绝不动句法——润色失败顶多不自然，不引入新错误。
-                    if getattr(self.cfg, "enable_zh_polish", True):
-                        out = zh_polish(out)
-                    with self.lock:
-                        self._cache[text] = out
-                        if len(self._cache) > 800:
-                            self._cache.popitem(last=False)
-                        if self._active != ch:
-                            self._active = ch
-                            self._remember(ch)
-                            switched = True
-                    if switched:
-                        self._say(f"翻译通道：{CHANNEL_NAMES.get(ch, ch)}")
-                    return out
+                out = self._fire(ch, send, src, timeout=min(4.0, left),
+                                 context=ctx_block if ch == "custom" else "")
             except Exception as exc:
                 last_err = exc
                 with self.lock:
                     self._dead.add(ch)      # 这个通道确认不通，本次别再等它超时了
                 continue
-            if last_err:
-                self._say(f"翻译失败（{type(last_err).__name__}）：可填 API Key 或代理后重试")
-                self._reprobe_later()
-            return None
+            # 空返回多半是通道临时抽风：换下一个通道，别让整句直接没有译文
+            if not (out and out.strip()):
+                continue
+            out = html.unescape(out.strip())
+            # 免费通道语境护栏：请求里拼了一段前文，模型可能把前文一起翻出来，
+            # 甚至整段改写成一句话。只认换行分段、只取最后一段（当前句）；
+            # 切不开或长度明显超长就当作污染，用干净单句重发一次，拿不到就换通道。
+            if use_free:
+                seg = self._split_free_segment(out)
+                if seg is None or len(seg) > max(60, len(text) * 3):
+                    self._say("免费语境分段失败，回退单句")
+                    left = deadline - time.time()
+                    plain = None
+                    if left > 0.2:
+                        try:
+                            plain = self._fire(ch, pro, src, timeout=min(4.0, left))
+                        except Exception as exc:
+                            last_err = exc
+                    if not (plain and plain.strip()):
+                        continue
+                    out = html.unescape(plain.strip())
+                else:
+                    out = seg
+            # 上下文污染护栏：模型偶尔会把前文一起翻出来（字幕里出现两句以上），
+            # 长度明显超出当前句就直接丢弃，让界面只显示原文
+            if ctx_block and len(out) > max(60, len(text) * 3):
+                self._say("译文疑似混入上下文，已丢弃")
+                return None
+            # 免费通道（尤其 MyMemory 匿名额度）对很短的句子会返回一大串拼凑乱码，
+            # 比如「こんにちは」→ "penian ferein OU潘托斯所有安卓sofou"。
+            # 这里绝不能 continue 去试其它通道：edge/google/deepl 都要等满超时，
+            # 实测会把这句的翻译拖到 12 秒，字幕就彻底跟不上说话了。
+            # 直接放弃译文，让界面只显示原文。
+            if self._is_junk(text, out):
+                return None
+            # 译文口语化润色（确定性规则、0ms）：免费通道的固定生硬模式
+            # （伙计们→大家、您→你、想尝试→想试试、半角标点、句尾书面句号）。
+            # 规则只动词级与标点，绝不动句法——润色失败顶多不自然，不引入新错误。
+            if getattr(self.cfg, "enable_zh_polish", True):
+                out = zh_polish(out)
+            with self.lock:
+                self._cache[cache_key] = out
+                if len(self._cache) > 800:
+                    self._cache.popitem(last=False)
+                if self._active != ch:
+                    self._active = ch
+                    self._remember(ch)
+                    switched = True
+            if switched:
+                self._say(f"翻译通道：{CHANNEL_NAMES.get(ch, ch)}")
+            return out
 
-    def _fire(self, ch: str, text: str, src: str = "ja", timeout: float = 4.0) -> Optional[str]:
+        # 走到这里说明所有通道都没给出可用译文（超预算 / 空返回 / 全部异常）
+        if last_err:
+            self._say(f"翻译失败（{type(last_err).__name__}）：可填 API Key 或代理后重试")
+        self._reprobe_later()
+        return None
+
+    def _fire(self, ch: str, text: str, src: str = "ja", timeout: float = 4.0,
+              context: str = "") -> Optional[str]:
         """发一次请求并记下时间（后台保活靠它判断是不是已经空闲了）。"""
         try:
-            return self._dispatch(ch, text, src, timeout)
+            return self._dispatch(ch, text, src, timeout, context)
         finally:
             self._last_req = time.time()
 
@@ -432,6 +507,21 @@ class Translator:
         if non_space == 0:
             return False
         return latin / non_space > 0.7
+
+    @staticmethod
+    def _split_free_segment(out: str) -> Optional[str]:
+        """从「前缀+当前句」的译文里取出当前句：只认换行分段。
+
+        免费通道没有上下文参数，只能把前文拼在待翻译文本前面；译文一般会保留
+        换行，取最后一段就是当前句。切不开（只有一段）返回 None，交给调用方
+        判定为污染并回退单句——绝不猜句子边界，猜错就会把上一句译文顶上来。
+        """
+        if not out:
+            return None
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            return None
+        return lines[-1]
 
     @staticmethod
     def _is_junk(src: str, out: str) -> bool:
