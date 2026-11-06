@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import Deque, List, Optional, Tuple
 
@@ -32,6 +33,13 @@ class SpeechSegmenter:
         self._noise = 0.01
         # 最近若干帧的电平历史：底噪取其中的低分位，避免被说话声/BGM 带跑
         self._hist: Deque[float] = deque(maxlen=240)
+        # 分段计时用的时间锚点（见 core/timing.py）：
+        # _samples 是累计喂入的采样数，_last_voiced_* 记录「最后一个有声音的块」，
+        # 用来算「说完话 → 判定断句」到底等了多久（静音阈值 / max_speech 两条路径）。
+        self._samples = 0
+        self._last_voiced_sample = 0
+        self._last_voiced_wall = 0.0
+        self.last_cut: dict = {}
         self._reset()
 
     def _reset(self, keep_noise: bool = True) -> None:
@@ -74,6 +82,7 @@ class SpeechSegmenter:
         x = chunk.astype(np.float32, copy=False)
         level = float(np.sqrt(np.mean(np.square(x))))
         self.last_level = level
+        self._samples += len(x)
         chunk_ms = len(x) * 1000.0 / self.sample_rate
 
         ratio = 5.0 - 4.0 * float(self.sensitivity)
@@ -103,6 +112,8 @@ class SpeechSegmenter:
                 self._pre.popleft()
 
         if voiced:
+            self._last_voiced_sample = self._samples
+            self._last_voiced_wall = time.perf_counter()
             if not self.in_speech:
                 self.in_speech = True
                 self._buf = list(self._pre)
@@ -114,7 +125,9 @@ class SpeechSegmenter:
             self._speech_ms += chunk_ms
             self._silence_ms = 0
             if self._speech_ms >= self.max_speech_ms:
-                return self._cut_at_dip(), level
+                seg = self._cut_at_dip()
+                self._mark_cut("max_speech", seg, 0.0)
+                return seg, level
             return None, level
 
         # 静音
@@ -124,9 +137,28 @@ class SpeechSegmenter:
             self._silence_ms += chunk_ms
             if self._silence_ms >= self.min_silence_ms:
                 if self._speech_ms >= self.min_speech_ms:
-                    return self._emit(), level
+                    silence_ms = self._silence_ms
+                    seg = self._emit()
+                    self._mark_cut("silence", seg, silence_ms)
+                    return seg, level
                 self._reset()
         return None, level
+
+    def _mark_cut(self, reason: str, audio: Optional[np.ndarray], tail_ms: float) -> None:
+        """记下这一刀是怎么断的、到底等了多久（供 core/timing.py 读，不影响断句）。"""
+        if audio is None or len(audio) == 0:
+            return
+        end_ts = self._last_voiced_wall or time.perf_counter()
+        self.last_cut = {
+            "cut": reason,
+            "audio_s": len(audio) / self.sample_rate,
+            # 音频时间轴上的等待：最后一个有声块 → 判定断句，等于静音阈值/强切位置
+            "tail_ms": float(tail_ms),
+            # 墙上时间的等待：受采集块大小影响，和用户体感一致
+            "wall_tail_ms": max(0.0, (time.perf_counter() - end_ts) * 1000.0),
+            "audio_end_ts": end_ts,
+            "cut_ts": time.perf_counter(),
+        }
 
     def _cut_at_dip(self) -> Optional[np.ndarray]:
         """max_speech 到点时的强切：在尾部窗口里挑「块能量最低」的边界下刀。
@@ -194,6 +226,8 @@ class SpeechSegmenter:
     def flush(self) -> Optional[np.ndarray]:
         """停止时把残留的一段吐出来。"""
         if self.in_speech and self._speech_ms >= self.min_speech_ms and self._buf:
-            return self._emit(force=True)
+            seg = self._emit(force=True)
+            self._mark_cut("flush", seg, 0.0)
+            return seg
         self._reset()
         return None

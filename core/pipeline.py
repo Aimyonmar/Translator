@@ -20,6 +20,7 @@ from .context import ContextBuffer, fix_homophones, fix_translation
 from .translator import Translator
 from .vad import SpeechSegmenter
 from .denoise import Denoise
+from . import timing
 
 
 class Pipeline:
@@ -449,19 +450,21 @@ class Pipeline:
                 except Exception:
                     pass
             if seg is not None and len(seg) > TARGET_SR * 0.2:
-                self._put_asr(seg)
+                self._put_asr((seg, dict(self.vad.last_cut)))
         tail = self.vad.flush()
         if tail is not None and len(tail) > TARGET_SR * 0.3:
-            self._put_asr(tail)
+            self._put_asr((tail, dict(self.vad.last_cut)))
 
     def _asr_loop(self, stop_evt: threading.Event) -> None:
         while not stop_evt.is_set():
             try:
-                seg = self._asr_q.get(timeout=0.5)
+                item = self._asr_q.get(timeout=0.5)
             except Exception:
                 continue
             if stop_evt.is_set():
                 break
+            seg, meta = self._unpack_seg(item)
+            merged = 1
             # 碎片段合并：VAD 偶尔会把一句话剁出 <0.45s 的碎段（语气词/吸气/单拍词），
             # 碎段单独送识别必出「诶、那个」式碎片字幕，而且短段的 ASR 固定开销占比极高
             # （实测 0.72s 音频要识别 0.74s，RTF≈1）。稍等下一段拼上（20ms 静音垫
@@ -471,17 +474,26 @@ class Pipeline:
                     nxt = self._asr_q.get(timeout=0.25)
                 except Exception:
                     nxt = None
-                if nxt is not None and len(nxt) > 0:
+                nxt_audio, nxt_meta = self._unpack_seg(nxt)
+                if nxt_audio is not None and len(nxt_audio) > 0:
                     pad = np.zeros(TARGET_SR // 50, dtype=np.float32)
-                    seg = np.concatenate([seg, pad, nxt])
+                    seg = np.concatenate([seg, pad, nxt_audio])
+                    # 合并后这句话真正「结束」的位置是最后一段的断句时刻，
+                    # 计时锚点也随之换成最后一段的（见 core/timing.py）
+                    meta = nxt_meta or meta
+                    merged += 1
                     while len(seg) < TARGET_SR * 5.0 and len(seg) < TARGET_SR * 0.45:
                         try:
                             nxt2 = self._asr_q.get(timeout=0.25)
                         except Exception:
                             break
-                        if nxt2 is None or len(nxt2) == 0:
+                        nxt2_audio, nxt2_meta = self._unpack_seg(nxt2)
+                        if nxt2_audio is None or len(nxt2_audio) == 0:
                             break
-                        seg = np.concatenate([seg, pad, nxt2])
+                        seg = np.concatenate([seg, pad, nxt2_audio])
+                        meta = nxt2_meta or meta
+                        merged += 1
+            t_asr_start = time.perf_counter()
             t0 = time.time()
             roster = self.cfg.name_roster if getattr(self.cfg, "enable_namefix", True) else ""
             hotwords = ""
@@ -493,6 +505,7 @@ class Pipeline:
                                         builtin=bool(getattr(self.cfg, "builtin_titles", True)))
             text = self.asr.transcribe(seg, word_map=self.cfg.word_map,
                                        roster=roster, hotwords=hotwords)
+            t_asr_end = time.perf_counter()
             # 识别是最长的一段耗时：停止请求若发生在识别途中，这里必须及时收手，
             # 否则识别完还会占用新序号、往已清空的队列里塞旧内容
             if stop_evt.is_set():
@@ -529,9 +542,24 @@ class Pipeline:
             with self._seq_lock:
                 seq = self._seq
                 self._seq += 1
+            # 分段计时锚点：断句 → 排队 → 识别 → 上屏原文（后续译文再记）
+            try:
+                meta.update({
+                    "audio_s": len(seg) / TARGET_SR,
+                    "merged": merged,
+                    "queue_ms": (t_asr_start - meta.get("cut_ts", t_asr_start)) * 1000.0,
+                    "asr_ms": (t_asr_end - t_asr_start) * 1000.0,
+                    "asr_end_ts": t_asr_end,
+                })
+            except Exception:
+                meta = {}
             # 先上屏原文：实测翻译还要 0.2~0.8 秒，画面空着等这段时间最难受
             try:
                 self.on_partial(seq, text)
+            except Exception:
+                pass
+            try:
+                meta["partial_ts"] = time.perf_counter()
             except Exception:
                 pass
             # 送去翻译的文本可以做「标题术语替换」（エルデンリング→艾尔登法环）：
@@ -546,7 +574,14 @@ class Pipeline:
                         builtin=bool(getattr(self.cfg, "builtin_titles", True)))
                 except Exception:
                     tr_text = text
-            self._put_keep_newest(self._tr_q, (seq, tr_text, text), on_drop=self._skip_seq)
+            self._put_keep_newest(self._tr_q, (seq, tr_text, text, meta), on_drop=self._skip_seq)
+
+    @staticmethod
+    def _unpack_seg(item):
+        """(音频, 计时元数据) → 两者；兼容直接塞 ndarray 的旧调用。"""
+        if isinstance(item, tuple):
+            return item[0], item[1]
+        return item, {}
 
     @staticmethod
     def _put_keep_newest(q: "queue.Queue", item, on_drop=None) -> None:
@@ -612,7 +647,7 @@ class Pipeline:
                 continue
             if stop_evt.is_set():
                 break
-            seq, tr_text, disp_text = item
+            seq, tr_text, disp_text, meta = item
             # 带上最近几句做语境：只对自定义 LLM 通道生效，免费通道仍是单句
             ctx = ()
             if getattr(self.cfg, "enable_context", True):
@@ -621,15 +656,20 @@ class Pipeline:
                 except Exception:
                     ctx = ()
             # 翻译必须兜住异常：这个线程一旦被异常打断就再也不会出字幕了
+            t_tr_start = time.perf_counter()
+            req0 = getattr(self.translator, "req_count", 0)
             try:
                 out = self.translator.translate(tr_text, context=ctx)
             except Exception as exc:
                 out = ""
                 self.on_status(f"翻译异常：{type(exc).__name__}")
+            finally:
+                t_tr_end = time.perf_counter()
+            meta["req"] = getattr(self.translator, "req_count", 0) - req0
             if stop_evt.is_set():      # 停止后别再往新一轮的状态里写旧序号
                 break
             with self._seq_lock:
-                self._pending[seq] = (disp_text, out or "")
+                self._pending[seq] = (disp_text, out or "", meta, t_tr_start, t_tr_end)
             self._flush_ordered()
 
     def _flush_ordered(self) -> None:
@@ -649,12 +689,41 @@ class Pipeline:
                 seq = self._next_seq
                 self._next_seq += 1
             # 译文兜底：原文已认对（如「返信」）但译文仍出现固定错译（「变身」）时改回
-            disp_text, out = item
+            disp_text, out, meta, t_tr_start, t_tr_end = item
+            t_screen = time.perf_counter()
             if out and getattr(self.cfg, "enable_homophone_fix", True):
                 try:
                     out, fixes = fix_translation(disp_text, out)
                     for note in fixes:
                         self.on_status(f"译文纠错：{note}")
+                except Exception:
+                    pass
+            # 分段计时（默认关闭，TRANSLATOR_TIMING=1 才写日志）：
+            # total_ms 从「最后一个有声音的样本」算起，是用户真正感受到的延迟。
+            if timing.enabled():
+                try:
+                    end_ts = meta.get("audio_end_ts") or t_screen
+                    partial_ts = meta.get("partial_ts") or t_screen
+                    asr_ts = meta.get("asr_end_ts") or t_tr_start
+                    timing.record(
+                        seq=seq,
+                        cut=meta.get("cut", ""),
+                        merged=meta.get("merged", 1),
+                        audio_s=meta.get("audio_s", 0.0),
+                        vad_tail_ms=meta.get("tail_ms", 0.0),
+                        vad_wall_tail_ms=meta.get("wall_tail_ms", 0.0),
+                        queue_ms=meta.get("queue_ms", 0.0),
+                        asr_ms=meta.get("asr_ms", 0.0),
+                        partial_ms=(partial_ts - end_ts) * 1000.0,
+                        trans_wait_ms=(t_tr_start - asr_ts) * 1000.0,
+                        trans_ms=(t_tr_end - t_tr_start) * 1000.0,
+                        order_ms=(t_screen - t_tr_end) * 1000.0,
+                        total_ms=(t_screen - end_ts) * 1000.0,
+                        chars=len(disp_text),
+                        trans_ok=1 if out else 0,
+                        req=meta.get("req", 1),
+                        channel=self.translator.last_channel(),
+                    )
                 except Exception:
                     pass
             try:
