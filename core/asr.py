@@ -28,7 +28,7 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # Windows 默认无权创建符号链接，hub 会留下 0 字节的空模型文件，直接改成复制
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
 
-MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
+MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v3-turbo", "large-v2", "large-v3"]
 
 
 def _gpu_free_gb() -> Optional[float]:
@@ -204,14 +204,19 @@ class WhisperASR:
                 if on_progress:
                     on_progress(f"正在加载 Whisper 模型 {size}（{device}/{ct}）…")
                 try:
-                    self.model = WhisperModel(size, device=device, compute_type=ct)
+                    # CPU 默认只有 4 个解码线程，实测 small 在 16 线程下 RTF 0.70，
+                    # 4 线程是 1.17（追不上实时）。这里按逻辑核数放开，最多 16。
+                    threads = min(16, os.cpu_count() or 4) if device == "cpu" else 0
+                    self.model = WhisperModel(
+                        size, device=device, compute_type=ct,
+                        **({"cpu_threads": threads} if threads else {}))
                     self._smoke()          # 真的跑一次推理，别让"缺 DLL 的 GPU"蒙混过关
                     self.model_size = size
                     self._loaded_size = size
-                    self.dev_info = f"{device}/{ct}"
-                    # GPU 上一次把多个语音块并行送进解码器（batch_size），能显著压短
-                    # 长段/长句的识别耗时（仅新版 faster-whisper 的 transcribe 支持）；
-                    # CPU 没有意义，保持 1。
+                    self.dev_info = f"{device}/{ct}" + (f" x{threads}" if threads else "")
+                    # 1.2.1 的 WhisperModel.transcribe 并不接受 batch_size，本项目
+                    # 的 _batch_supported() 会挡住它；这个属性只是留给未来版本。
+                    # 真正要批处理得换 BatchedInferencePipeline，逐句实时场景反而更慢。
                     self.batch_size = 8 if device == "cuda" else 1
                     if on_progress:
                         note = "" if size == asked else \

@@ -13,12 +13,20 @@ from typing import Callable, Optional
 
 REPO_PREFIX = "models--Systran--faster-whisper-"
 
+# 不是 Systran 发布的型号要单独写仓库名；否则按 Systran/faster-whisper-<size> 拼。
+# large-v3-turbo：Systran 没有这个仓库，这里用的正是 faster-whisper 内置别名
+# "large-v3-turbo" 指向的那一份，保证「缓存判定」和「实际加载」看到同一个目录。
+_REPO_OVERRIDES = {
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+}
+
 # 首次下载的估算体积（MB），用于在 UI 上先告诉用户要花多少空间
 EST_SIZE_MB = {
     "tiny": 75,
     "base": 145,
     "small": 484,
     "medium": 1530,
+    "large-v3-turbo": 1620,
     "large-v2": 3090,
     "large-v3": 3090,
 }
@@ -33,8 +41,13 @@ def cache_root() -> str:
         os.path.expanduser("~"), ".cache", "huggingface")
 
 
+def repo_id(size: str) -> str:
+    return _REPO_OVERRIDES.get(size, f"Systran/faster-whisper-{size}")
+
+
 def model_dir(size: str) -> str:
-    return os.path.join(cache_root(), "hub", REPO_PREFIX + size)
+    # hub 的缓存目录名 = "models--" + 仓库名里的 "/" 换成 "--"
+    return os.path.join(cache_root(), "hub", "models--" + repo_id(size).replace("/", "--"))
 
 
 def snapshot_dir(size: str) -> Optional[str]:
@@ -60,9 +73,9 @@ def is_partial(size: str) -> bool:
     return os.path.isdir(model_dir(size)) and not is_downloaded(size)
 
 
-def size_bytes(size: str) -> int:
+def _path_bytes(path: str) -> int:
     total = 0
-    for dirpath, _dirs, files in os.walk(model_dir(size)):
+    for dirpath, _dirs, files in os.walk(path):
         for name in files:
             try:
                 total += os.path.getsize(os.path.join(dirpath, name))
@@ -71,14 +84,22 @@ def size_bytes(size: str) -> int:
     return total
 
 
+def size_bytes(size: str) -> int:
+    return _path_bytes(model_dir(size))
+
+
 def total_bytes() -> int:
-    """所有 Whisper 模型缓存合计占用的字节数。"""
+    """所有 Whisper 模型缓存合计占用的字节数。
+
+    不能只匹配 Systran 前缀：turbo 在 mobiuslabsgmbh 名下（见 _REPO_OVERRIDES），
+    按前缀扫会漏算，界面上的「已占用」就偏小。"""
     hub = os.path.join(cache_root(), "hub")
     try:
-        names = [n for n in os.listdir(hub) if n.startswith(REPO_PREFIX)]
+        names = [n for n in os.listdir(hub)
+                 if n.startswith("models--") and "faster-whisper" in n]
     except OSError:
         return 0
-    return sum(size_bytes(n[len(REPO_PREFIX):]) for n in names)
+    return sum(_path_bytes(os.path.join(hub, n)) for n in names)
 
 
 def remove(size: str) -> int:
@@ -104,7 +125,7 @@ def download(size: str, progress: Optional[Callable[[str], None]] = None) -> str
 
     from huggingface_hub import snapshot_download
 
-    repo = f"Systran/faster-whisper-{size}"
+    repo = repo_id(size)
     if progress:
         progress(f"开始下载 {size}（约 {EST_SIZE_MB.get(size, 0)} MB）…")
     snapshot_download(repo)
