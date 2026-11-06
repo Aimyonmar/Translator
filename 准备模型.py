@@ -14,7 +14,6 @@ faster-whisper 的下载进度条会被吞掉，用户只看到「正在加载�
 """
 from __future__ import annotations
 
-import glob
 import json
 import os
 import sys
@@ -30,15 +29,9 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-# 模型仓库体积（MB，HF 上 faster-whisper 转换版的实测大小，用于给用户预期）
-SIZE_MB = {
-    "tiny": 75,
-    "base": 145,
-    "small": 484,
-    "medium": 1530,
-    "large-v3": 3090,
-    "large-v2": 3090,
-}
+# 模型仓库体积（MB）与缓存判定统一由 core.model_store 提供：面板、asr、
+# 本脚本共用一套，避免两处表各写一份、越走越偏
+from core.model_store import EST_SIZE_MB as SIZE_MB, snapshot_dir
 
 
 def _pick_model() -> str:
@@ -68,14 +61,7 @@ def _cached_path(size: str) -> str | None:
     不用 snapshot_download(local_files_only=True) 判断：镜像下载没写 refs 时它会
     误报「未缓存」，于是每次启动都重新联网，看起来像卡住。
     """
-    base = os.path.join(
-        os.environ["HF_HOME"], "hub",
-        f"models--Systran--faster-whisper-{size}", "snapshots",
-    )
-    for snap in sorted(glob.glob(os.path.join(base, "*")), reverse=True):
-        if os.path.exists(os.path.join(snap, "model.bin")):
-            return snap
-    return None
+    return snapshot_dir(size)
 
 
 def main() -> int:

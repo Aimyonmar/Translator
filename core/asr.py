@@ -226,11 +226,14 @@ class WhisperASR:
             raise RuntimeError(f"所有加载组合都失败：{last_exc}")
 
     def _cached(self) -> bool:
-        """本地是否已有该模型的缓存。"""
-        home = os.environ.get("HF_HOME") or os.path.join(
-            os.path.expanduser("~"), ".cache", "huggingface")
-        hub = os.path.join(home, "hub", f"models--Systran--faster-whisper-{self.model_size}")
-        return os.path.isdir(hub)
+        """本地是否已有该模型的完整缓存。
+
+        以前只判目录在不在：下载中断时目录也在，会被误判成「已缓存」，
+        接着置 HF_HUB_OFFLINE=1，加载一个缺文件的模型必然失败。
+        现在交给 model_store 按 snapshots 里的必需文件判定。
+        """
+        from .model_store import is_downloaded
+        return is_downloaded(self.model_size)
 
     def _smoke(self) -> None:
         """用极短静音跑一次推理：GPU 缺运行库时会在这里就暴露，而不是等到真正识别时。"""

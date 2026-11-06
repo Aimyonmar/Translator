@@ -2,17 +2,19 @@
 """控制面板：设备 / 模型 / 翻译 / 字幕 参数调节与运行状态。"""
 from __future__ import annotations
 
+import threading
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel, QComboBox,
-    QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox, QPlainTextEdit,
-    QProgressBar, QMessageBox, QLineEdit, QScrollArea, QFrame, QApplication,
-    QAbstractSpinBox,
+    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout, QGroupBox, QLabel,
+    QComboBox, QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox,
+    QPlainTextEdit, QProgressBar, QMessageBox, QLineEdit, QScrollArea, QFrame,
+    QApplication, QAbstractSpinBox,
 )
 
+from core import model_store
 from core.asr import MODEL_SIZES
 from core.translator import CHANNELS, CHANNEL_NAMES, LANGS
 from ui import theme
@@ -44,11 +46,17 @@ class ControlPanel(QWidget):
     # 运行状态也走信号：流水线在后台线程里把 state 改成 error/stopped 时，
     # 按钮文字必须跟着变回「开始翻译」，不能只靠 toggle_start 那一次同步
     sig_running = Signal(bool, bool)
+    # 模型缓存：下载/卸载在后台线程做，进度与结果一律回主线程更新控件
+    sig_mdl_log = Signal(str)
+    sig_mdl_done = Signal()
+    sig_mdl_fail = Signal(str)
 
     def __init__(self, cfg, controller):
         super().__init__()
         self.cfg = cfg
         self.ctrl = controller
+        self._running = False
+        self._mdl_busy: Optional[str] = None
         self.setWindowTitle("VTuber 实时翻译器")
         self.setWindowIcon(_icon())
         self.setMinimumWidth(520)
@@ -61,6 +69,9 @@ class ControlPanel(QWidget):
         self.sig_devices.connect(self.set_devices)
         self.sig_proxy_text.connect(self.txt_proxy.setText)
         self.sig_running.connect(self.set_running)
+        self.sig_mdl_log.connect(self._log)
+        self.sig_mdl_done.connect(self._on_mdl_done)
+        self.sig_mdl_fail.connect(self._on_mdl_fail)
         self._apply_default_size()
         # 滚轮防误触：整窗统一过滤，滑过下拉框/数值框时先滚页面（见 eventFilter）
         app = QApplication.instance()
@@ -242,6 +253,32 @@ class ControlPanel(QWidget):
             "显存被游戏占用放不下时会自动临时降级到 medium/small 保速度\n"
             "（状态栏会提示），关掉游戏重启即可回到大模型。")
         root.addWidget(box_asr)
+
+        # 模型缓存：状态直接读磁盘上的真实文件；已下载的只给「卸载」，
+        # 没有下载入口，从 UI 上就堵死重复下载。
+        box_mdl = QGroupBox("模型缓存（已下载的可离线使用，卸载即释放磁盘）")
+        grid = QGridLayout(box_mdl)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
+        self._mdl_rows = {}
+        for r, size in enumerate(MODEL_SIZES):
+            lbl_name = QLabel(size)
+            lbl_name.setMinimumWidth(72)
+            lbl_state = QLabel("…")
+            lbl_state.setObjectName("hint")
+            btn = QPushButton("下载")
+            btn.setFixedWidth(88)
+            btn.clicked.connect(lambda _=False, s=size: self._on_mdl_click(s))
+            grid.addWidget(lbl_name, r, 0)
+            grid.addWidget(lbl_state, r, 1)
+            grid.addWidget(btn, r, 2)
+            self._mdl_rows[size] = (lbl_state, btn)
+        self.lbl_mdl_total = QLabel("")
+        self.lbl_mdl_total.setObjectName("hint")
+        grid.addWidget(self.lbl_mdl_total, len(MODEL_SIZES), 0, 1, 3)
+        root.addWidget(box_mdl)
+        self._refresh_models()
 
         # 翻译
         box_tr = QGroupBox("翻译（免费通道无需 Key；填 Key 或代理可显著提升质量）")
@@ -547,6 +584,94 @@ class ControlPanel(QWidget):
         self.cfg.save()
         self.ctrl.on_model_changed()
 
+    # ------------------------------------------------------------ 模型缓存
+    def _refresh_models(self) -> None:
+        """按磁盘实际文件刷新每行状态；不看 refs、不看内存变量。"""
+        for size, (lbl, btn) in self._mdl_rows.items():
+            if model_store.is_downloaded(size):
+                used = model_store.size_bytes(size) / (1024 * 1024)
+                lbl.setText(f"已下载 · 占用 {used:.0f} MB")
+                lbl.setStyleSheet(f"color:{theme.OK}; font-size:11px;")
+                btn.setText("卸载")
+                btn.setToolTip("删除该模型的本地缓存，释放磁盘空间；之后需重新下载才能使用")
+            else:
+                if model_store.is_partial(size):
+                    left = model_store.size_bytes(size) / (1024 * 1024)
+                    lbl.setText(f"未下载（{left:.0f} MB 残留，重新下载会续传）")
+                    lbl.setStyleSheet(f"color:{theme.WARN}; font-size:11px;")
+                else:
+                    est = model_store.EST_SIZE_MB.get(size, 0)
+                    lbl.setText(f"未下载（约 {est} MB）")
+                    lbl.setStyleSheet(f"color:{theme.TEXT_MUTED}; font-size:11px;")
+                btn.setText("下载")
+                btn.setToolTip("下载到本地缓存（走 hf-mirror 镜像）")
+            btn.setEnabled(not self._running and self._mdl_busy != size)
+        if self._mdl_busy:
+            _lbl, btn = self._mdl_rows[self._mdl_busy]
+            btn.setText("处理中…")
+            btn.setEnabled(False)
+        total = model_store.total_bytes() / (1024 * 1024)
+        self.lbl_mdl_total.setText(
+            f"当前缓存共占用 {total:.0f} MB；已下载的模型不会重复下载。")
+
+    def _on_mdl_click(self, size: str) -> None:
+        if self._mdl_busy:
+            self._log("已有模型下载/卸载任务在进行，等它结束再操作")
+            return
+        # 点下去时再判一次：状态可能刚被别处改过，已下载绝不触发下载
+        if model_store.is_downloaded(size):
+            used = model_store.size_bytes(size) / (1024 * 1024)
+            ans = QMessageBox.question(
+                self, "卸载模型",
+                f"确定删除本地缓存的 {size} 模型吗？\n\n"
+                f"将释放约 {used:.0f} MB 磁盘空间；删除后需要重新下载才能使用该模型。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+            # 先让识别器松手，否则 Windows 上文件被占用会删不掉
+            self._release_loaded(size)
+            action = "remove"
+        else:
+            action = "download"
+        self._mdl_busy = size
+        self._refresh_models()
+        threading.Thread(target=self._mdl_task, args=(size, action), daemon=True).start()
+
+    def _mdl_task(self, size: str, action: str) -> None:
+        """后台线程：只做磁盘/网络操作，结果用信号回主线程。"""
+        try:
+            if action == "download":
+                model_store.download(size, progress=self.sig_mdl_log.emit)
+                self.sig_mdl_log.emit(f"模型 {size} 已就绪，可离线使用")
+            else:
+                freed = model_store.remove(size)
+                self.sig_mdl_log.emit(
+                    f"已卸载模型 {size}，释放 {freed / (1024 * 1024):.0f} MB 磁盘空间")
+        except Exception as exc:
+            name = "下载" if action == "download" else "卸载"
+            self.sig_mdl_fail.emit(f"{name}模型 {size} 失败：{exc}")
+        finally:
+            self.sig_mdl_done.emit()
+
+    def _on_mdl_done(self) -> None:
+        self._mdl_busy = None
+        self._refresh_models()
+
+    def _on_mdl_fail(self, msg: str) -> None:
+        self._log(msg)
+        self._mdl_busy = None
+        self._refresh_models()
+        QMessageBox.warning(self, "模型缓存", msg)
+
+    def _release_loaded(self, size: str) -> None:
+        """卸载前释放已加载的同名模型，避免 Windows 上缓存文件被占用。"""
+        try:
+            asr = getattr(getattr(self.ctrl, "pipeline", None), "asr", None)
+            if asr is not None and getattr(asr, "model_size", None) == size:
+                asr.unload()
+        except Exception:
+            pass
+
     def _on_wordmap(self) -> None:
         self.cfg.word_map = self.txt_wordmap.text().strip()
         self.cfg.save()
@@ -680,6 +805,9 @@ class ControlPanel(QWidget):
         self.btn_pause.setEnabled(running)
         self.cmb_model.setEnabled(not running)
         self.cmb_dev.setEnabled(not running)
+        # 运行中不让动模型缓存：换/删文件会让正在跑的识别器失去模型
+        self._running = running
+        self._refresh_models()
 
     def set_subtitle_visible(self, visible: bool) -> None:
         self.btn_sub.setText("隐藏字幕" if visible else "显示字幕")
