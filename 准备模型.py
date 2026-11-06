@@ -14,6 +14,7 @@ faster-whisper 的下载进度条会被吞掉，用户只看到「正在加载�
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
@@ -21,6 +22,13 @@ import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
+
+# 控制台编码（chcp 936）偶发编不出的字符不该让脚本崩掉，宁可显示成 ?
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 # 模型仓库体积（MB，HF 上 faster-whisper 转换版的实测大小，用于给用户预期）
 SIZE_MB = {
@@ -52,6 +60,22 @@ def _fail(msg: str) -> int:
     print(msg)
     print("=" * 58)
     return 1
+
+
+def _cached_path(size: str) -> str | None:
+    """按目录结构判断模型是否已经完整下载。
+
+    不用 snapshot_download(local_files_only=True) 判断：镜像下载没写 refs 时它会
+    误报「未缓存」，于是每次启动都重新联网，看起来像卡住。
+    """
+    base = os.path.join(
+        os.environ["HF_HOME"], "hub",
+        f"models--Systran--faster-whisper-{size}", "snapshots",
+    )
+    for snap in sorted(glob.glob(os.path.join(base, "*")), reverse=True):
+        if os.path.exists(os.path.join(snap, "model.bin")):
+            return snap
+    return None
 
 
 def main() -> int:
@@ -86,13 +110,11 @@ def main() -> int:
             "    .runtime\\venv\\Scripts\\python.exe -m pip install -r requirements.txt"
         )
 
-    # 先看缓存：已经下过就直接结束，避免每次启动都联网检查
-    try:
-        path = snapshot_download(repo, local_files_only=True)
-        print(f"已在本地缓存，无需下载：{path}")
+    # 先看缓存：已经下过就直接结束，不联网、不重复下载
+    cached = _cached_path(size)
+    if cached:
+        print(f"已在本地缓存，无需下载：{cached}")
         return 0
-    except Exception:
-        pass
 
     print("开始下载（进度条为已下载文件数与总量，网络中断可以重新运行本脚本续传）…")
     print()
