@@ -4,10 +4,24 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, Optional
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+
+# 主线程、翻译线程（Translator._remember）、设备探测线程都会调 save()。
+# 不加锁时两个线程可能同时写同一文件，写出半截 JSON，下次启动配置直接回落默认值。
+_SAVE_LOCK = threading.Lock()
+
+
+def _clamp(value: Any, lo, hi, cast):
+    """把配置值夹到合法区间；类型不对时返回 None（由调用方决定是否保留原值）。"""
+    try:
+        v = cast(value)
+    except (TypeError, ValueError):
+        return None
+    return min(max(v, lo), hi)
 
 
 @dataclass
@@ -48,6 +62,17 @@ class AppConfig:
     # 「モンハンワイルズ」→「蒙汉威尔斯」；换成中文名后分别变成
     # 「我买了艾尔登法环的DLC」与「怪物猎人：荒野的发售日好像决定了」。
     enable_title_glossary: bool = True
+    # 语境辅助（设计见 docs/语境翻译设计.md）
+    # 翻译层上下文总开关：最近几条原文/译文只注入自定义 LLM 通道，免费通道保持单句
+    enable_context: bool = True
+    context_window: int = 3        # 带几条上下文，0~8；0 等价关闭
+    # 识别层同音词纠正（変身→返信）：按上下文线索判定，每次改动都会上报状态栏
+    enable_homophone_fix: bool = True
+    # 免费通道（腾讯/彩云/Edge/Google/DeepL…）也带语境：把上一句原文作为极短前缀
+    # 一起送翻，再按分隔切回当前句。试验项，默认关闭（关闭时行为与原来完全一致）
+    enable_free_context: bool = False
+    # 语境术语表：多行「原词=译法」，当前句出现时按此译法（仅 LLM 通道）
+    context_glossary: str = ""
     # 翻译
     channel: str = "auto"
     target_lang: str = "zh-Hans"
@@ -108,22 +133,94 @@ class AppConfig:
     show_panel: bool = True
 
     def save(self) -> None:
+        """原子写：先写临时文件再替换，避免中途失败/并发写留下半截 JSON。"""
+        data = asdict(self)
+        tmp = CONFIG_PATH + ".tmp"
+        with _SAVE_LOCK:
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, CONFIG_PATH)
+            except Exception:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+
+    # 数值字段的合法区间：(下限, 上限, 类型)。config.json 是用户可手改的边界，
+    # 越界/类型错误在这里夹回安全范围，别让 int(None) 之类的问题拖到界面构造或 VAD 里才炸。
+    _NUM_RANGES = {
+        "sensitivity": (0.0, 1.0, float),
+        "denoise_strength": (0.0, 1.0, float),
+        "vocal_strength": (0.0, 1.0, float),
+        "min_speech_ms": (50, 5000, int),
+        "min_silence_ms": (100, 3000, int),
+        "max_speech_ms": (500, 60000, int),
+        "beam_size": (1, 5, int),
+        "context_window": (0, 8, int),
+        "font_size": (10, 72, int),
+        "source_font_size": (8, 48, int),
+        "opacity": (0.1, 1.0, float),
+        "bg_opacity": (0, 255, int),
+        "max_lines": (1, 8, int),
+        "auto_clear_sec": (0.0, 600.0, float),
+        "window_width": (0, 10000, int),
+        "screen_index": (0, 16, int),
+    }
+
+    _STR_FIELDS = (
+        "model_size", "asr_device", "compute_type", "source_lang", "channel", "target_lang",
+        "custom_type", "custom_key", "custom_base", "custom_model", "caiyun_token",
+        "last_channel", "word_map", "name_roster", "proxy", "context_glossary",
+    )
+
+    def _sanitize(self) -> None:
+        """读取后校验：类型兜底 + 区间夹取，坏值回落到默认语义。"""
+        for name, (lo, hi, cast) in self._NUM_RANGES.items():
+            v = _clamp(getattr(self, name, None), lo, hi, cast)
+            if v is None:
+                # 类型完全不对（如 "abc"）时回落到字段默认值，而不是把坏值原样带进运行时
+                v = _clamp(getattr(type(self), name, None), lo, hi, cast)
+            if v is not None:
+                setattr(self, name, v)
+        for name in self._STR_FIELDS:
+            v = getattr(self, name, "")
+            if not isinstance(v, str):
+                setattr(self, name, "")
+        if not isinstance(self.device, dict):
+            self.device = None
+        if not isinstance(self.geometry, dict):
+            self.geometry = None
+        if not self.target_lang:
+            self.target_lang = "zh-Hans"
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(asdict(self), f, ensure_ascii=False, indent=2)
+            from .asr import MODEL_SIZES
         except Exception:
-            pass
+            MODEL_SIZES = ()
+        if MODEL_SIZES and self.model_size not in MODEL_SIZES:
+            self.model_size = "small"
 
     @classmethod
     def load(cls) -> "AppConfig":
         cfg = cls()
+        if not os.path.exists(CONFIG_PATH):
+            return cfg
         try:
-            if os.path.exists(CONFIG_PATH):
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # 只认 dataclass 字段：以前用 hasattr，JSON 里出现 "save" 之类的键
+                # 会把方法覆盖成字符串，之后 cfg.save() 直接炸
+                fields = type(cfg).__dataclass_fields__
                 for k, v in data.items():
-                    if hasattr(cfg, k):
+                    if k in fields:
                         setattr(cfg, k, v)
         except Exception:
-            pass
+            # 坏文件先留证：否则下一次 save() 用默认值把它覆盖掉，问题无从复查
+            try:
+                os.replace(CONFIG_PATH, CONFIG_PATH + ".bad")
+            except Exception:
+                pass
+        cfg._sanitize()
         return cfg

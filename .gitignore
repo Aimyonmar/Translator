@@ -1,11 +1,13 @@
 # ========== 不入库清单：提交到 GitHub 的只有「纯源码」 ==========
 
 # 运行环境与模型缓存（约 4.5 GB：venv + Whisper 模型 + pip 缓存）
-# ——完整重建方式见 README「一、启动」
+# ——完整重建方式见 README「一、快速开始」
 .runtime/
 
 # 本机生成的配置（设备、窗口位置、通道偏好；填入的 API Key 也存在这里）
+# config.json.bad 是解析失败时的自动备份，同样含密钥，一律不入库
 config.json
+config.json.bad
 
 # 运行日志（含本机绝对路径）
 *.log

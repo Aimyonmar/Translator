@@ -91,7 +91,10 @@ def _single_instance() -> bool:
         return False
     QLocalServer.removeServer(name)
     _SERVER = QLocalServer()
-    _SERVER.listen(name)
+    if not _SERVER.listen(name):
+        # 锁没抢到也要继续跑（功能不能因此不可用），但日志里必须留痕：
+        # 这种情况下再双击不会提示「已经在运行」，会起第二份副本。
+        print(f"单实例锁获取失败：{_SERVER.errorString()}，仍继续启动", flush=True)
     return True
 
 from PySide6.QtCore import Qt, QTimer
@@ -110,6 +113,7 @@ from ui.panel import ControlPanel, _icon
 class AppController:
     def __init__(self, app: QApplication):
         self.app = app
+        self._quitting = False          # 退出收尾只跑一次（面板关闭/托盘退出可能同时触发）
         self.cfg = AppConfig.load()
         self.pipeline = Pipeline(self.cfg)
         self.overlay = SubtitleOverlay(self.cfg)
@@ -172,6 +176,11 @@ class AppController:
     def status(self, text: str) -> None:
         self.panel.sig_status.emit(text)
         self.panel.sig_log.emit(text)
+        # 按钮状态跟着流水线真实状态走：模型/采集失败时流水线已经是 error，
+        # 但 set_running 原来只在 toggle_start 里调用，面板会一直停在
+        # 「停止翻译」——看起来在运行，实际字幕早就不出了。
+        st = self.pipeline.state
+        self.panel.sig_running.emit(st in ("loading", "running", "paused"), st == "paused")
 
     def on_partial(self, seq: int, src: str) -> None:
         """识别先出结果：字幕立刻动起来，译文随后补上。"""
@@ -214,10 +223,6 @@ class AppController:
         self.tray.activated.connect(lambda r: self.show_panel() if r == QSystemTrayIcon.DoubleClick else None)
         self.tray.show()
 
-    def on_panel_hidden(self) -> None:
-        self.tray.showMessage("VTuber 实时翻译器", "已最小化到托盘，双击图标可重新打开",
-                              QSystemTrayIcon.Information, 2500)
-
     def show_panel(self) -> None:
         self.panel.show()
         self.panel.raise_()
@@ -226,18 +231,22 @@ class AppController:
     # ------------------------------------------------------------ 控制动作
     def refresh_devices(self) -> None:
         def work():
-            devs = list_capture_devices()
-            cur = None
-            if self.cfg.device:
-                from core.audio import AudioDevice
-                cur = AudioDevice.from_dict(self.cfg.device)
-            if cur is None:
-                cur = pick_default_device()
-                if cur is not None:
-                    self.cfg.device = cur.to_dict()
-                    self.cfg.save()
-            self.panel.set_devices(devs, cur)
-            self.status(f"发现 {len(devs)} 个音频设备，当前：{cur.label if cur else '无'}")
+            try:
+                devs = list_capture_devices()
+                cur = None
+                if self.cfg.device:
+                    from core.audio import AudioDevice
+                    cur = AudioDevice.from_dict(self.cfg.device)
+                if cur is None:
+                    cur = pick_default_device()
+                    if cur is not None:
+                        self.cfg.device = cur.to_dict()
+                        self.cfg.save()
+                # 控件只能由主线程操作：工作线程通过信号投递，别直接调 panel.set_devices
+                self.panel.sig_devices.emit(devs, cur)
+                self.status(f"发现 {len(devs)} 个音频设备，当前：{cur.label if cur else '无'}")
+            except Exception as exc:
+                self.status(f"枚举音频设备失败：{exc}")
         threading.Thread(target=work, daemon=True).start()
 
     def on_device_selected(self, dev) -> None:
@@ -313,7 +322,8 @@ class AppController:
             if found:
                 self.cfg.proxy = found
                 self.cfg.save()
-                self.panel.txt_proxy.setText(found)
+                # 同上：探针线程不直接碰控件，交给主线程更新输入框
+                self.panel.sig_proxy_text.emit(found)
                 self.pipeline.translator.apply_proxy()
                 self.status(f"发现代理 {found}，已启用；Google/Edge 通道可用了")
                 self.pipeline.translator.probe()
@@ -350,13 +360,35 @@ class AppController:
         self.overlay.setVisible(vis)
         self.panel.set_subtitle_visible(vis)
 
-    def quit(self) -> None:
+    def cleanup(self) -> None:
+        """退出收尾（可重复调用）：先隐藏窗口，再停流水线、放锁。
+
+        顺序很重要——pipeline.stop() 最坏要等音频线程 join 2 秒，
+        若先停再藏，字幕窗会在这段时间里继续留在桌面上。
+        """
+        try:
+            self.overlay.hide()
+            self.panel.hide()
+            self.tray.hide()
+        except Exception:
+            pass
         self.pipeline.stop()
+        # 主动释放单实例名：别等进程彻底结束才放手，
+        # 否则收尾期间再双击会误判「已经在运行」
+        if _SERVER is not None:
+            _SERVER.close()
+
+    def quit(self) -> None:
+        """真正退出：保存布局 → 隐藏全部窗口 → 停采集/流水线 → 放锁 → 退出事件循环。"""
+        if self._quitting:
+            return
+        self._quitting = True
         self.cfg.geometry = {"x": self.overlay.x(), "y": self.overlay.y(),
                              "w": self.overlay.width(), "h": self.overlay.height()}
         self.cfg.window_width = self.overlay.width()
         self.cfg.save()
-        self.tray.hide()
+        self.cleanup()
+        print("==== VTuber 实时翻译器退出 ====", flush=True)
         self.app.quit()
 
 
@@ -369,15 +401,17 @@ def main() -> int:
     app.setStyle("Fusion")
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
-        QMessageBox.warning(None, "提示", "系统托盘不可用，程序将在关闭窗口后继续在后台运行。")
+        QMessageBox.warning(None, "提示", "系统托盘不可用：关掉控制面板就等于退出程序。")
 
     if not _single_instance():
+        print("==== 已有实例在运行，本次启动已取消 ====", flush=True)
         QMessageBox.information(
             None, "VTuber 实时翻译器",
             "程序已经在运行了。\n\n"
+            "· 已经帮你把控制面板叫到前台\n"
             "· 字幕窗在屏幕底部（可能被别的窗口挡住，看一眼）\n"
             "· 或在屏幕右下角托盘里找它的图标\n\n"
-            "如果完全没反应，关掉它再用「调试模式启动.bat」看报错。")
+            "如果主界面确实找不到了，用任务管理器结束 pythonw.exe 后再启动。")
         return 0
 
     try:
@@ -387,7 +421,9 @@ def main() -> int:
         msg = "启动失败，详情见 run.log：\n\n" + traceback.format_exc(limit=3)
         QMessageBox.critical(None, "VTuber 实时翻译器 启动失败", msg)
         return 1
-    app.aboutToQuit.connect(lambda: ctrl.pipeline.stop())
+    # 兜底收尾：无论从面板关闭、托盘退出还是系统关机触发，
+    # 都保证窗口先隐藏、单实例名被释放，不把字幕窗留在桌面上
+    app.aboutToQuit.connect(ctrl.cleanup)
     return app.exec()
 
 

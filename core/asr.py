@@ -177,8 +177,12 @@ class WhisperASR:
 
             # 模型已经在本地缓存了就别联网：本机有系统代理，联网检查常被拦成
             # ProxyError 502，反而让"明明有模型"也加载失败。
+            # 必须两个分支都写：只在命中缓存时置 1 的话，切到未缓存的新模型时
+            # 这个环境变量还粘着，下载会被永久拦住，只能重启程序才能恢复。
             if self._cached():
                 os.environ["HF_HUB_OFFLINE"] = "1"
+            else:
+                os.environ.pop("HF_HUB_OFFLINE", None)
 
             dev = self.device
             if dev == "auto":

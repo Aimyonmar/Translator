@@ -16,6 +16,7 @@ import numpy as np
 from .audio import AudioCapture, AudioDevice, TARGET_SR, pick_default_device
 from .asr import WhisperASR
 from .config import AppConfig
+from .context import ContextBuffer, fix_homophones, fix_translation
 from .translator import Translator
 from .vad import SpeechSegmenter
 from .denoise import Denoise
@@ -53,29 +54,70 @@ class Pipeline:
         self._seq = 0
         self._next_seq = 0
         self._pending: dict = {}
+        # 被队列丢弃的序号：上屏时必须跳过它们，否则 _next_seq 会卡在缺口上，
+        # 之后所有译文都堆在 _pending 里再也不上屏（表现为字幕彻底停住）。
+        self._skipped: set = set()
         self._threads: list = []
+        # 停止令牌：每次 start() 换一个新的，旧令牌立刻置位。
+        # 若共用同一个 Event，stop()→start() 之间的 clear() 会让上一轮线程「复活」，
+        # 出现两套采集/识别/翻译线程同时跑（重复字幕、CPU/GPU 翻倍）。
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._pause.set()
+        # 语境窗口：最近几句上屏内容，供同音词纠正与翻译上下文使用。
+        # 容量固定 8（配置上限），每次按 cfg.context_window 取用。
+        self.context = ContextBuffer(maxlen=8)
 
     # ------------------------------------------------------------ 控制
     def start(self) -> None:
         if self.state in ("running", "loading", "paused"):
             return
-        self._stop.clear()
+        # 换新令牌：旧线程只认自己启动时拿到的那个，不会被这次 start 复活
+        old = self._stop
+        if old is not None:
+            old.set()
+        self._stop = threading.Event()
+        stop_evt = self._stop
         self._pause.set()
+        # 清掉上一轮可能残留的序号状态：老线程在停止瞬间写进来的 pending
+        # 不能污染新一轮的上屏顺序（否则会在新序号走到同一数字时冒出旧字幕）
+        with self._seq_lock:
+            self._pending.clear()
+            self._skipped.clear()
+            self._seq = 0
+            self._next_seq = 0
+        # 新一场直播：上一场的句子不能当这一场的语境
+        self.context.clear()
         self.state = "loading"
         self.on_status("正在准备模型…")
-        t = threading.Thread(target=self._boot, daemon=True)
-        t.start()
+        threading.Thread(target=self._boot, args=(stop_evt,), daemon=True).start()
 
-    def _boot(self) -> None:
+    def _boot(self, stop_evt: threading.Event) -> None:
+        def aborted() -> bool:
+            """停止请求已下达：收尾刚建好的采集，保持 stopped，不再改回 running。"""
+            if not stop_evt.is_set():
+                return False
+            # 已有新一轮运行时（self._stop 换了），这轮只负责退出，
+            # 绝不能去动新一轮的 capture/state
+            if self._stop is stop_evt:
+                cap, self.capture = self.capture, None
+                if cap is not None:
+                    try:
+                        cap.stop()
+                    except Exception:
+                        pass
+                self.state = "stopped"
+            return True
+
         try:
             # 不再用 gpu_ok 记住「上次 GPU 失败」而直接锁死 CPU：
             # 失败多半是显存被游戏临时占满，重启后显存空了就该回 GPU。
             # load() 内部按显存余量自动选档并逐级降级，GPU 真不可用时
             # 几秒内就会落到可用组合，不会像以前那样白等。
             self.asr.load(on_progress=self.on_status)
+            # 冷启动加载要十几秒，这期间用户可能已经点了停止
+            if aborted():
+                return
             if self.asr.dev_info.startswith("cpu") and getattr(self.cfg, "gpu_ok", True):
                 self.cfg.gpu_ok = False
                 try:
@@ -83,6 +125,8 @@ class Pipeline:
                 except Exception:
                     pass
         except Exception as exc:
+            if aborted():
+                return
             self.state = "error"
             self.on_status(f"模型加载失败：{exc}（首次需联网下载，可检查网络或换用更小模型）")
             return
@@ -113,18 +157,30 @@ class Pipeline:
                     except Exception:
                         pass
                 dev = cur if cur is not None else dev
-            self.capture = self._new_capture(dev)
-            self.capture.start()
+            cap = self._new_capture(dev)
+            cap.start()
             time.sleep(0.4)
-            if self.capture.error:
+            # 采集起来后再确认归属：若期间已经 stop() 或已被新一轮接管，
+            # 这个流由本轮自己关掉，不能写进 self.capture 去顶掉新一轮的采集
+            if stop_evt.is_set() or self._stop is not stop_evt:
+                cap.stop()
+                if self._stop is stop_evt:
+                    self.state = "stopped"
+                return
+            self.capture = cap
+            if cap.error:
                 self.state = "error"
-                self.on_status(f"音频采集失败：{self.capture.error}")
+                self.on_status(f"音频采集失败：{cap.error}")
                 return
         except Exception as exc:
+            if aborted():
+                return
             self.state = "error"
             self.on_status(f"音频采集失败：{exc}")
             return
 
+        if stop_evt.is_set():
+            return
         self.state = "running"
         self._cap_restarts = 0
         self.on_status(f"正在聆听…（系统声音 · {self.asr.model_size} {self.asr.dev_info}）")
@@ -132,7 +188,7 @@ class Pipeline:
         # 并发别开太高：免费 MyMemory 会限流，开 4 路反而把请求拖到十几秒。
         for fn, n in ((self._capture_loop, 1), (self._asr_loop, 1), (self._trans_loop, 2)):
             for _ in range(n):
-                th = threading.Thread(target=fn, daemon=True)
+                th = threading.Thread(target=fn, args=(stop_evt,), daemon=True)
                 th.start()
                 self._threads.append(th)
 
@@ -149,6 +205,7 @@ class Pipeline:
                 q.queue.clear()
         with self._seq_lock:
             self._pending.clear()
+            self._skipped.clear()
             self._seq = 0
             self._next_seq = 0
         self._threads = []
@@ -206,8 +263,10 @@ class Pipeline:
             return False
         return cur.name != getattr(self.capture.device, "name", "")
 
-    def _restart_capture(self, reason: str) -> None:
+    def _restart_capture(self, reason: str, stop_evt: threading.Event) -> None:
         """采集流静默死亡后的自动恢复：先试原设备，不行就换系统默认回环设备。"""
+        if stop_evt.is_set():
+            return
         self.on_status(f"{reason}，正在自动恢复采集…")
         try:
             if self.capture:
@@ -216,6 +275,21 @@ class Pipeline:
             pass
         try:
             dev = AudioDevice.from_dict(self.cfg.device) if self.cfg.device else None
+            # 保存的是「跟随系统默认」的回环时，必须先重新挑当前默认设备：
+            # 插耳机/切蓝牙后默认输出已经变了，旧扬声器回环虽然还能打开，
+            # 但那边没有声音、永远不会有回调，一直重开它就会「有声音、没字幕」。
+            # 手动选定的具体设备（is_default=False）保持不动，尊重用户选择。
+            if dev is None or dev.is_default:
+                cur = pick_default_device()
+                if cur is not None and (dev is None or (cur.name, cur.backend) != (dev.name, dev.backend)):
+                    if dev is not None:
+                        self.on_status(f"默认声音设备已切换为「{cur.name}」，采集已自动跟随")
+                    dev = cur
+                    self.cfg.device = cur.to_dict()
+                    try:
+                        self.cfg.save()
+                    except Exception:
+                        pass
             new = self._new_capture(dev)
             new.start()
             time.sleep(0.5)
@@ -236,6 +310,9 @@ class Pipeline:
                 if new.error:
                     self.on_status(f"自动恢复失败：{new.error}")
                     return
+            if stop_evt.is_set():      # 恢复期间用户已停止：别把新采集留着空转
+                new.stop()
+                return
             self.capture = new
             self.on_status("采集已自动恢复")
         except Exception as exc:
@@ -300,16 +377,18 @@ class Pipeline:
             c.vocal_strength = float(getattr(self.cfg, "vocal_strength", 0.8))
 
     # ------------------------------------------------------------ 工作线程
-    def _capture_loop(self) -> None:
+    def _capture_loop(self, stop_evt: threading.Event) -> None:
         last_level_post = 0.0
         started = time.time()
         peak = 0.0
         warned = False
-        while not self._stop.is_set():
+        while not stop_evt.is_set():
             self._pause.wait()
-            if self._stop.is_set() or self.capture is None:
+            if stop_evt.is_set() or self.capture is None:
                 break
             chunk = self.capture.read(timeout=0.3)
+            if stop_evt.is_set():
+                break
             # 采集看门狗：切默认设备/插拔耳机/VMware 虚拟声卡上下线时，
             # WASAPI 回环流会「静默死亡」——不报错、不再有回调，永远没声音。
             # 中途断流（曾收到过数据）就自动重启采集；带退避和次数上限防死循环。
@@ -331,8 +410,24 @@ class Pipeline:
                 else:
                     reason = "采集似乎断开（可能切换了声音设备）"
                 self._cap_restarts = getattr(self, "_cap_restarts", 0) + 1
-                self._restart_capture(reason)
+                self._restart_capture(reason, stop_evt)
+                # 换设备后按新设备重新计时：新设备仍然静音或打不开时，要能再提示一次
+                started = time.time()
+                peak = 0.0
+                warned = False
                 continue
+            # 「一次回调都没有」不是静音，而是流根本没数据：典型场景是插了耳机、
+            # 声音从耳机出却还绑在旧扬声器回环上（WASAPI 对没在播放的设备不派发回调），
+            # 或设备被独占/禁用、采样率打不开。这种情况必须明确说出来，
+            # 否则界面永远停在「正在聆听…」，用户会以为程序坏了。
+            if (cap is not None and cap.running and not cap.ever_data
+                    and time.time() - started > 12.0 and not warned):
+                warned = True
+                if cap.error:
+                    self.on_status(f"音频采集不可用：{cap.error}（请在「采集设备」里刷新后改选）")
+                else:
+                    self.on_status("采集设备一直没有数据 —— 若刚插了耳机/切了蓝牙，"
+                                   "请在「采集设备」里刷新并改选耳机对应的 [系统声音]")
             if chunk is None:
                 continue
             if self.denoise.enable:
@@ -359,13 +454,13 @@ class Pipeline:
         if tail is not None and len(tail) > TARGET_SR * 0.3:
             self._put_asr(tail)
 
-    def _asr_loop(self) -> None:
-        while not self._stop.is_set():
+    def _asr_loop(self, stop_evt: threading.Event) -> None:
+        while not stop_evt.is_set():
             try:
                 seg = self._asr_q.get(timeout=0.5)
             except Exception:
                 continue
-            if self._stop.is_set():
+            if stop_evt.is_set():
                 break
             # 碎片段合并：VAD 偶尔会把一句话剁出 <0.45s 的碎段（语气词/吸气/单拍词），
             # 碎段单独送识别必出「诶、那个」式碎片字幕，而且短段的 ASR 固定开销占比极高
@@ -398,12 +493,26 @@ class Pipeline:
                                         builtin=bool(getattr(self.cfg, "builtin_titles", True)))
             text = self.asr.transcribe(seg, word_map=self.cfg.word_map,
                                        roster=roster, hotwords=hotwords)
+            # 识别是最长的一段耗时：停止请求若发生在识别途中，这里必须及时收手，
+            # 否则识别完还会占用新序号、往已清空的队列里塞旧内容
+            if stop_evt.is_set():
+                break
             if text and hotwords:
                 # prompt 回声护栏：解码器偶尔把热词表当内容吐出来，宁可少一句也不上屏词表
                 from .namefix import prompt_echo
                 if prompt_echo(text, hotwords):
                     self.on_status("已丢弃一段疑似「热词复述」的输出")
                     continue
+            # 语境同音词纠正（変身→返信）：只有「含错形 + 有线索 + 无反向线索」才改，
+            # 每次改动都上报，便于发现改错后关掉 enable_homophone_fix
+            if text and getattr(self.cfg, "enable_homophone_fix", True):
+                try:
+                    text, fixes = fix_homophones(
+                        text, self.context.sources(int(getattr(self.cfg, "context_window", 3))))
+                    for note in fixes:
+                        self.on_status(f"语境纠错：{note}")
+                except Exception:
+                    pass
             # 用实测的单段耗时动态决定 _asr_q 能积压几段（见 _put_asr）
             try:
                 el = time.time() - t0
@@ -437,17 +546,33 @@ class Pipeline:
                         builtin=bool(getattr(self.cfg, "builtin_titles", True)))
                 except Exception:
                     tr_text = text
-            self._put_keep_newest(self._tr_q, (seq, tr_text, text))
+            self._put_keep_newest(self._tr_q, (seq, tr_text, text), on_drop=self._skip_seq)
 
     @staticmethod
-    def _put_keep_newest(q: "queue.Queue", item) -> None:
-        """队列满时丢最旧的、保最新的：宁可跳掉积压的旧内容，也要让字幕跟得上当下。"""
+    def _put_keep_newest(q: "queue.Queue", item, on_drop=None) -> None:
+        """队列满时丢最旧的、保最新的：宁可跳掉积压的旧内容，也要让字幕跟得上当下。
+
+        `on_drop` 会收到被丢掉的那一项：上屏层必须知道这个序号已经作废，
+        否则有序输出会一直等它（见 _flush_ordered）。
+        """
         if q.full():
             try:
-                q.get_nowait()
+                old = q.get_nowait()
+                if on_drop is not None:
+                    on_drop(old)
             except Exception:
                 pass
         q.put_nowait(item)
+
+    def _skip_seq(self, item) -> None:
+        """登记一个不会再产出译文的序号，让 _next_seq 能跨过它继续上屏。"""
+        try:
+            seq = item[0]
+        except Exception:
+            return
+        with self._seq_lock:
+            if seq >= self._next_seq:
+                self._skipped.add(seq)
 
     # 允许积压的识别工作量（秒）。超出就把最旧的丢掉，保证字幕跟得上当下。
     ASR_PENDING_SEC = 3.0
@@ -478,37 +603,67 @@ class Pipeline:
             except Exception:
                 pass
 
-    def _trans_loop(self) -> None:
+    def _trans_loop(self, stop_evt: threading.Event) -> None:
         """多个翻译线程并行跑（网络请求是瓶颈），但输出仍按识别顺序排好。"""
-        while not self._stop.is_set():
+        while not stop_evt.is_set():
             try:
                 item = self._tr_q.get(timeout=0.5)
             except Exception:
                 continue
-            if self._stop.is_set():
+            if stop_evt.is_set():
                 break
             seq, tr_text, disp_text = item
+            # 带上最近几句做语境：只对自定义 LLM 通道生效，免费通道仍是单句
+            ctx = ()
+            if getattr(self.cfg, "enable_context", True):
+                try:
+                    ctx = self.context.snapshot(int(getattr(self.cfg, "context_window", 3)))
+                except Exception:
+                    ctx = ()
             # 翻译必须兜住异常：这个线程一旦被异常打断就再也不会出字幕了
             try:
-                out = self.translator.translate(tr_text)
+                out = self.translator.translate(tr_text, context=ctx)
             except Exception as exc:
                 out = ""
                 self.on_status(f"翻译异常：{type(exc).__name__}")
+            if stop_evt.is_set():      # 停止后别再往新一轮的状态里写旧序号
+                break
             with self._seq_lock:
                 self._pending[seq] = (disp_text, out or "")
             self._flush_ordered()
 
     def _flush_ordered(self) -> None:
-        """并行翻译会乱序返回，这里按识别顺序依次上屏，保证字幕不颠倒。"""
+        """并行翻译会乱序返回，这里按识别顺序依次上屏，保证字幕不颠倒。
+
+        队列满被丢弃的序号登记在 _skipped 里，这里先跳过它们再取下一个，
+        否则一个缺口就会把后面所有句子永久卡在 _pending 里。
+        """
         while True:
             with self._seq_lock:
+                while self._next_seq in self._skipped:
+                    self._skipped.discard(self._next_seq)
+                    self._next_seq += 1
                 item = self._pending.pop(self._next_seq, None)
                 if item is None:
                     break
                 seq = self._next_seq
                 self._next_seq += 1
+            # 译文兜底：原文已认对（如「返信」）但译文仍出现固定错译（「变身」）时改回
+            disp_text, out = item
+            if out and getattr(self.cfg, "enable_homophone_fix", True):
+                try:
+                    out, fixes = fix_translation(disp_text, out)
+                    for note in fixes:
+                        self.on_status(f"译文纠错：{note}")
+                except Exception:
+                    pass
             try:
                 # 翻译失败也要把原文顶上去，别让字幕一片空白
-                self.on_result(seq, item[0], item[1])
+                self.on_result(seq, disp_text, out)
+            except Exception:
+                pass
+            # 只在真正上屏后入窗：并行翻译回包是乱序的，按上屏顺序记才不会错位
+            try:
+                self.context.push(disp_text, out)
             except Exception:
                 pass

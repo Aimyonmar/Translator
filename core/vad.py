@@ -27,10 +27,22 @@ class SpeechSegmenter:
         self.last_level = 0.0
         self.threshold = 0.01
         self.in_speech = False
+        # 底噪估计跨句保留：若每断一句就归零，下一句开头几秒阈值会退回保守值，
+        # 安静语音容易漏触发、有持续 BGM 时又容易误触发。
+        self._noise = 0.01
+        # 最近若干帧的电平历史：底噪取其中的低分位，避免被说话声/BGM 带跑
+        self._hist: Deque[float] = deque(maxlen=240)
         self._reset()
 
-    def _reset(self) -> None:
-        self._noise = 0.01
+    def _reset(self, keep_noise: bool = True) -> None:
+        """清空断句状态。
+
+        keep_noise=True 用于正常断句——底噪是环境属性，不该每句重学；
+        False 用于停止/暂停/换设备，此时环境可能已经变了，重新适应。
+        """
+        if not keep_noise:
+            self._noise = 0.01
+            self._hist = deque(maxlen=240)
         self._buf: List[np.ndarray] = []
         self._levels: List[float] = []     # 与 _buf 平行的每块电平（pre-roll 块记 +inf）
         self._speech_ms = 0
@@ -38,8 +50,6 @@ class SpeechSegmenter:
         self._pre: Deque[np.ndarray] = deque()
         self._pre_ms = 0
         self.in_speech = False
-        # 最近若干帧的电平历史：底噪取其中的低分位，避免被说话声/BGM 带跑
-        self._hist: Deque[float] = deque(maxlen=240)
 
     def update_params(self, sensitivity: Optional[float] = None, min_speech_ms: Optional[int] = None,
                       min_silence_ms: Optional[int] = None, max_speech_ms: Optional[int] = None) -> None:
@@ -53,7 +63,8 @@ class SpeechSegmenter:
             self.max_speech_ms = max_speech_ms
 
     def reset(self) -> None:
-        self._reset()
+        """对外重置（停止/暂停/换设备）：环境可能变了，底噪一并重新适应。"""
+        self._reset(keep_noise=False)
 
     # -- 核心
     def feed(self, chunk: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
