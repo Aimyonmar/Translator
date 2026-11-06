@@ -311,11 +311,16 @@ class ControlPanel(QWidget):
         self.cmb_model.setCurrentText(self.cfg.model_size)
         self.cmb_model.blockSignals(False)
         self.cmb_model.setToolTip(
-            "small：最快（约 0.2s），直播口语识别一般。\n"
-            "medium：口语/专有名词识别明显更准，GPU 下约 0.5s。\n"
-            "口语多的直播建议换 medium。\n"
-            "large-v3：识别最准（尤其口音/外来语/嘈杂），GPU 下约 1s，最吃显存；\n"
-            "6~8GB 显卡会自动改用 int8 跑。\n"
+            "small：最快（本机约 0.21s/句），直播口语识别一般。\n"
+            "medium：口语/专有名词识别更准，但比 small 慢约一倍；同理，\n"
+            "口语多的直播可以把 small 换成它。\n"
+            "large-v3-turbo：精度优于 small/medium、略低于 large-v3；短句比 small\n"
+            "慢约四成，但 13 秒以上的长段反而更快；显存约 1.2GB。\n"
+            "kotoba-whisper-v2.0（日语专用）：短句接近 small，13 秒以上长段最快；\n"
+            "但游戏标题/人名准确率不如 small（本机 CER 7.3% vs 3.3%），且不支持热词，\n"
+            "只建议纯日语、对速度要求高的直播使用。\n"
+            "large-v3：识别最准（尤其口音/外来语/嘈杂），但单句耗时约为 small 的 3 倍，\n"
+            "最吃显存（约 2GB）；6~8GB 显卡会自动改用 int8 跑。\n"
             "显存被游戏占用放不下时会自动临时降级到 medium/small 保速度\n"
             "（状态栏会提示），关掉游戏重启即可回到大模型。")
         self.cmb_model.currentTextChanged.connect(self._on_model_changed)
@@ -330,6 +335,12 @@ class ControlPanel(QWidget):
         row2.addWidget(QLabel("运算"))
         row2.addWidget(self.cmb_dev)
         f.addRow("模型 / 设备", row2)
+        # 本机实测（RTX 4050 6GB）：相同参数下 large-v3 约 0.63s/句、small 约 0.21s/句。
+        # 只写一句克制的说明，避免用户为了「更准」误选成 3 倍延迟而不自知。
+        self.lbl_model_hint = QLabel("large-v3 单句耗时约为 small 的 3 倍；追求实时性保持 small。")
+        self.lbl_model_hint.setObjectName("hint")
+        self.lbl_model_hint.setWordWrap(True)
+        f.addRow("", self.lbl_model_hint)
         root.addWidget(box_model)
 
         # 模型缓存：状态直接读磁盘上的真实文件；已下载的只给「卸载」，
