@@ -94,6 +94,11 @@ class AppConfig:
     enable_zh_polish: bool = True
     # 英文句路由：主播真说英文（拉丁字母占多数）时自动改走 EN→ZH。可设 False 关闭。
     enable_en_route: bool = True
+    # 主备式延迟补发（core/translator.py）：主通道超过 hedge_backup_ms 还没返回，
+    # 就并行补发第二条线路，取先到的可用译文。实测 P50/P90 不变、P99 少约 0.3 s，
+    # 代价是约 6% 的句子多发一次请求（见改进记录第二十节）。设 False 回到纯串行。
+    enable_hedge: bool = True
+    hedge_backup_ms: int = 400
     # 上次实际用通的翻译通道，下次启动直接复用，省去挨个试错的等待
     last_channel: str = ""
     # 音频转文字：上次选文件的目录，下次打开对话框直接落在这里
@@ -161,6 +166,7 @@ class AppConfig:
         "min_speech_ms": (50, 5000, int),
         "min_silence_ms": (100, 3000, int),
         "max_speech_ms": (500, 60000, int),
+        "hedge_backup_ms": (100, 2000, int),
         "beam_size": (1, 5, int),
         "context_window": (0, 8, int),
         "font_size": (10, 72, int),

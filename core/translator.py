@@ -78,6 +78,21 @@ class Translator:
         # （edge/google/deepl 在国内常常要各等 10 秒才失败，首次出字幕会拖到 20-30 秒后）
         self._active: Optional[str] = getattr(cfg, "last_channel", "") or None
         self._dead: set = set()      # 本次会话内已确认不通的通道，不再重试
+        # 计时诊断用：记录「这次请求最终由谁返回」。两个翻译线程并发，
+        # 所以用 thread-local，避免互相覆盖（见 core/timing.py）。
+        self._tls = threading.local()
+        # 双发翻译（见改进记录第二十节）：默认主备式——主通道超过 hedge_backup_ms
+        # 未返回才补发第二条，取先到的可用译文。目的不是降均值，而是砍掉单条线路
+        # 偶发的长尾；实测 P50/P90 不变、P99 少约 0.3 s，请求只多约 6%。
+        # single=纯串行（旧行为），dual=同时发（请求翻倍，仅实验用）。
+        self.hedge_mode = "backup" if getattr(cfg, "enable_hedge", True) else "single"
+        self.backup_delay_ms = int(getattr(cfg, "hedge_backup_ms", 400) or 400)
+        # 请求/失败计数与每条线路的实测往返，只用于 A/B 统计
+        self.req_count = 0
+        self.fail_count = 0
+        self.route_log: list = []
+        self._route_lock = threading.Lock()
+        self._gid = 0
         self.proxy: str = getattr(cfg, "proxy", "") or ""
         # 腾讯/彩云是国内直连通道，本来就不需要代理；而本机代理（127.0.0.1:7897）经常不稳，
         # 一旦让它们走代理，译文请求会集体超时被放弃 —— 字幕就只剩原文、译文消失。
@@ -299,6 +314,7 @@ class Translator:
         text = (text or "").strip()
         if not text:
             return None
+        self._tls.channel = ""
         # 上下文块在本地拼装（<0.1ms）：只有能接受 system prompt 的 custom 通道用得上
         ctx_block = ""
         if context and self.cfg is not None and getattr(self.cfg, "enable_context", True) \
@@ -354,11 +370,18 @@ class Translator:
             src = "en" if en_route else self.source
 
         last_err = None
+        gid = self._next_gid()      # A/B：同一句的线路记录共用这个号
         # 实时字幕有总预算：免费通道挨个试过去最坏能拖到二三十秒（实测 21 秒），
         # 字幕就彻底跟不上说话了。超预算立刻放弃译文、只显示原文。
         deadline = time.time() + (25.0 if custom else self.BUDGET)
         switched = False
-        for ch in order:
+        # A/B：只对前两条免费通道做双发/主备；custom 和带免费语境前缀的路径不参与
+        hedge_chs = [c for c in order if c != "custom"][:2]
+        use_hedge = self.hedge_mode != "single" and len(hedge_chs) == 2 and not free_ctx
+        # 双发的位置必须是「第一条免费通道」，不能是 i==0：
+        # 配了 custom 时 order 的第一项是 custom，那样会直接把 custom 顶掉。
+        hedge_i = order.index(hedge_chs[0]) if use_hedge else -1
+        for i, ch in enumerate(order):
             left = deadline - time.time()
             if left <= 0.2:
                 break
@@ -366,20 +389,31 @@ class Translator:
             # 再靠换行把当前句那段切出来（custom 通道走 system 上下文，不拼前缀）
             use_free = bool(free_ctx) and ch != "custom"
             send = (free_ctx + "\n" + pro) if use_free else pro
-            try:
-                # 只剩多少时间就只给多少超时：只在循环开头检查预算是拦不住的，
-                # 单次请求（实测 mymemory 4s + edge 鉴权 3s = 8 秒）会把预算整个冲破
-                out = self._fire(ch, send, src, timeout=min(4.0, left),
-                                 context=ctx_block if ch == "custom" else "")
-            except Exception as exc:
-                last_err = exc
-                with self.lock:
-                    self._dead.add(ch)      # 这个通道确认不通，本次别再等它超时了
-                continue
+            if i == hedge_i:
+                pick = self._race(
+                    hedge_chs, send, src, timeout=min(4.0, left),
+                    delay_ms=self.backup_delay_ms if self.hedge_mode == "backup" else 0,
+                    gid=gid)
+                if pick is None:
+                    continue
+                out, ch = pick
+            else:
+                try:
+                    # 只剩多少时间就只给多少超时：只在循环开头检查预算是拦不住的，
+                    # 单次请求（实测 mymemory 4s + edge 鉴权 3s = 8 秒）会把预算整个冲破
+                    out = self._timed_fire(ch, send, src, timeout=min(4.0, left),
+                                           context=ctx_block if ch == "custom" else "",
+                                           gid=gid)
+                except Exception as exc:
+                    last_err = exc
+                    with self.lock:
+                        self._dead.add(ch)      # 这个通道确认不通，本次别再等它超时了
+                    continue
             # 空返回多半是通道临时抽风：换下一个通道，别让整句直接没有译文
             if not (out and out.strip()):
                 continue
             out = html.unescape(out.strip())
+            self._tls.channel = ch
             # 免费通道语境护栏：请求里拼了一段前文，模型可能把前文一起翻出来，
             # 甚至整段改写成一句话。只认换行分段、只取最后一段（当前句）；
             # 切不开或长度明显超长就当作污染，用干净单句重发一次，拿不到就换通道。
@@ -434,13 +468,100 @@ class Translator:
         self._reprobe_later()
         return None
 
+    def _next_gid(self) -> int:
+        """给每句翻译分配一个分组号：A/B 时同一句的两条线路记录靠它配对。"""
+        with self._route_lock:
+            self._gid += 1
+            return self._gid
+
+    def _timed_fire(self, ch: str, text: str, src: str = "ja", timeout: float = 4.0,
+                    context: str = "", gid: int = 0) -> Optional[str]:
+        """_fire + 记录这条线路的实际往返，供 A/B 统计（不影响正常路径）。"""
+        t0 = time.perf_counter()
+        ok = False
+        try:
+            out = self._fire(ch, text, src, timeout, context)
+            ok = bool(out and out.strip())
+            return out
+        finally:
+            ms = (time.perf_counter() - t0) * 1000.0
+            with self._route_lock:
+                self.route_log.append({"gid": gid, "ch": ch, "ms": round(ms, 1),
+                                       "ok": ok, "text": text[:24]})
+                if len(self.route_log) > 2000:      # 长直播别无限涨
+                    del self.route_log[:-2000]
+
     def _fire(self, ch: str, text: str, src: str = "ja", timeout: float = 4.0,
               context: str = "") -> Optional[str]:
         """发一次请求并记下时间（后台保活靠它判断是不是已经空闲了）。"""
+        with self.lock:
+            self.req_count += 1
         try:
             return self._dispatch(ch, text, src, timeout, context)
+        except Exception:
+            with self.lock:
+                self.fail_count += 1
+            raise
         finally:
             self._last_req = time.time()
+
+    def _race(self, chs: List[str], text: str, src: str, timeout: float,
+              delay_ms: int, gid: int = 0) -> Optional[tuple]:
+        """主备/双发：先发 chs[0]；delay_ms 内没结果（或先失败了）就补发 chs[1]。
+
+        返回 (译文, 通道)；两条都不给可用译文时返回 None，交回原来的串行兜底。
+        败方请求在后台跑完后会把往返记进 route_log，供 A/B 统计，不阻塞上屏。
+        """
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+        def work(ch):
+            try:
+                return self._timed_fire(ch, text, src, timeout=timeout, gid=gid)
+            except Exception:
+                # 与串行路径一致：确认不通就本次会话不再重试，否则主备模式会每句都
+                # 先撞一次同一个坏通道
+                with self.lock:
+                    self._dead.add(ch)
+                return None
+
+        ex = ThreadPoolExecutor(max_workers=2)
+        futs = {ex.submit(work, chs[0]): chs[0]}
+        fired = 1
+        t0 = time.perf_counter()
+        if delay_ms <= 0 and len(chs) > 1:
+            futs[ex.submit(work, chs[1])] = chs[1]
+            fired = 2
+        best = None
+        while futs and best is None:
+            if fired < len(chs) and delay_ms > 0:
+                left = delay_ms / 1000.0 - (time.perf_counter() - t0)
+                if left > 0:
+                    done, _ = wait(list(futs), timeout=left, return_when=FIRST_COMPLETED)
+                else:
+                    done = set()
+            else:
+                done, _ = wait(list(futs), timeout=timeout + 0.5,
+                               return_when=FIRST_COMPLETED)
+            if not done:
+                if fired < len(chs):       # 主通道到点还没回：补发备份
+                    futs[ex.submit(work, chs[1])] = chs[1]
+                    fired += 1
+                    continue
+                break
+            for f in done:
+                ch = futs.pop(f)
+                try:
+                    out = f.result()
+                except Exception:
+                    out = None
+                if out and out.strip() and not self._is_junk(text, out):
+                    best = (out, ch)
+                    break
+                if fired < len(chs):       # 主通道先失败了：立刻补发备份
+                    futs[ex.submit(work, chs[1])] = chs[1]
+                    fired += 1
+        ex.shutdown(wait=False)
+        return best
 
     def start_keepalive(self) -> None:
         """空闲时每 15 秒发一个极小请求，把 HTTPS 连接保住。
@@ -592,6 +713,10 @@ class Translator:
     def clear_cache(self) -> None:
         with self.lock:
             self._cache.clear()
+
+    def last_channel(self) -> str:
+        """当前线程最近一次 translate 实际用到（或拿到响应）的通道，仅诊断用。"""
+        return getattr(self._tls, "channel", "") or ""
 
     # ---------------------------------------------------------- 代理
     @staticmethod
