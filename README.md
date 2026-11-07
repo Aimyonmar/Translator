@@ -182,7 +182,7 @@ Translator/
     config.py           配置读写
     context.py          语境缓冲、同音词纠正、术语表拼装
     model_store.py      识别模型缓存状态 / 下载 / 卸载
-    transcribe.py       本地音视频文件转写、TXT / SRT 导出
+    transcribe.py       本地音视频文件转写：断句 / 翻译 / 字词时间码，导出 TXT / SRT / ASS / 双语 / 译文 / 工程 JSON
   ui/
     overlay.py          悬浮字幕窗（自绘描边文字、可拖动）
     panel.py            控制面板
