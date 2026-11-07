@@ -3,6 +3,7 @@
 
 用法（装完 nvidia-cublas-cu12 后运行）：
     .runtime\\venv\\Scripts\\python.exe enable_gpu.py
+加 --copy-only 只复制 DLL、不做推理验证（安装脚本用：此时模型可能还没下载）。
 
 原理：pip 把 cublas64_12.dll 装在 site-packages\\nvidia\\cublas\\bin，
 但 Windows 加载 DLL 时不搜这个目录，所以要复制到 ctranslate2 自己的目录
@@ -45,6 +46,12 @@ def main():
         dst = os.path.join(CT_DIR, os.path.basename(d))
         shutil.copy2(d, dst)
         print("    已复制到 ctranslate2 目录 ->", os.path.basename(dst))
+
+    if "--copy-only" in sys.argv:
+        # 安装依赖脚本用：只把 DLL 放到位，不做推理验证
+        # （首次安装时模型通常还没下载，强行验证会误报 GPU 不可用）
+        print("\nDLL 已就位（--copy-only，跳过推理验证）。")
+        return 0
 
     print("\n验证 GPU 推理…")
     try:
