@@ -5,6 +5,9 @@ cd /d "%~dp0"
 set "PY=%~dp0.runtime\venv\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 
+rem 模型缓存固定项目内，覆盖系统里可能残留的 HF_HOME
+set "HF_HOME=%~dp0.runtime\hf"
+
 set HF_ENDPOINT=https://hf-mirror.com
 set "PIP_CACHE_DIR=%~dp0.runtime\pipcache"
 

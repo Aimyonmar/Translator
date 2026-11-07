@@ -38,10 +38,18 @@ EST_SIZE_MB = {
 _REQUIRED = ("model.bin", "config.json", "tokenizer.json")
 
 
+_RUNTIME_HF = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".runtime", "hf")
+
+
 def cache_root() -> str:
-    """与 asr.py 完全一致：优先 HF_HOME，其次用户目录默认缓存。"""
-    return os.environ.get("HF_HOME") or os.path.join(
-        os.path.expanduser("~"), ".cache", "huggingface")
+    """缓存目录固定为项目内 .runtime/hf，与 asr.py 一致。
+
+    不读环境里的 HF_HOME：用户环境里可能残留别的项目设的旧路径
+    （实测 D:\\tencent\\workbuddy-workplace\\settings\\hf），那样面板的
+    「已下载 / 占用」会和 asr 实际加载的目录对不上。
+    """
+    return _RUNTIME_HF
 
 
 def repo_id(size: str) -> str:
@@ -135,7 +143,7 @@ def download(size: str, progress: Optional[Callable[[str], None]] = None) -> str
     if is_downloaded(size):
         return snapshot_dir(size) or ""
 
-    os.environ.setdefault("HF_HOME", cache_root())
+    os.environ["HF_HOME"] = cache_root()
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
     # asr 加载旧模型时会置 HF_HUB_OFFLINE=1；不清掉的话本次下载会直接按离线失败

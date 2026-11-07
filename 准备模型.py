@@ -72,7 +72,9 @@ def _cached_path(size: str) -> str | None:
 
 def main() -> int:
     inherited = os.environ.get("HF_HOME")
-    os.environ.setdefault("HF_HOME", os.path.join(ROOT, ".runtime", "hf"))
+    # 必须直接覆盖：环境里可能残留别的项目设的 HF_HOME，setdefault 只会沿用那份旧路径，
+    # 结果模型下到旧目录、启动时按项目目录判定「没缓存」，每次都要重下。
+    os.environ["HF_HOME"] = os.path.join(ROOT, ".runtime", "hf")
     # 国内直连 huggingface.co 多半不通，默认走镜像；想用官方源就自己设 HF_ENDPOINT
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     # Windows 没开发者模式时 hub 会警告软链不可用，对使用无影响，关掉免得吓人
@@ -94,8 +96,8 @@ def main() -> int:
 
     print(f"模型：{repo}" + (f"（约 {mb} MB）" if mb else ""))
     print(f"缓存：{cache}")
-    if inherited:
-        print("（检测到系统已设 HF_HOME，模型与该目录共用，不会重复占用空间）")
+    if inherited and os.path.abspath(inherited) != os.path.abspath(os.environ["HF_HOME"]):
+        print(f"（已忽略环境里的 HF_HOME={inherited}，统一用项目内缓存）")
     print(f"下载源：{os.environ['HF_ENDPOINT']}")
     if mb:
         print(f"参考耗时：10 MB/s 约 {max(1, round(mb / 10 / 60))} 分钟，"

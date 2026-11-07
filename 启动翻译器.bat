@@ -6,6 +6,10 @@ title VTuber 实时翻译器
 set "PY=%~dp0.runtime\venv\Scripts\pythonw.exe"
 set "PYCON=%~dp0.runtime\venv\Scripts\python.exe"
 
+rem 模型缓存固定在项目内 .runtime\hf：系统里可能残留别的项目设的 HF_HOME，
+rem 这里显式覆盖，保证 准备模型.py / asr / 面板看到的是同一份缓存
+set "HF_HOME=%~dp0.runtime\hf"
+
 rem 依赖装在项目内 .runtime\venv；没有就先引导去安装，避免 pythonw 静默失败
 if not exist "%PYCON%" (
     echo   ============================================
@@ -40,7 +44,7 @@ if errorlevel 1 (
 )
 
 set HF_ENDPOINT=https://hf-mirror.com
-rem 模型缓存默认在项目内 .runtime\hf；若已在别处缓存，可设 HF_HOME 指向它
+rem 缓存目录已在上方固定为项目内 .runtime\hf，HF_ENDPOINT 只负责下载源
 set "PIP_CACHE_DIR=%~dp0.runtime\pipcache"
 
 echo.
