@@ -1468,6 +1468,15 @@ class ControlPanel(QWidget):
 
     def _update_diag(self) -> None:
         """实时显示音量与触发线的关系——有声音却不出字幕时，看这里就知道原因。"""
+        # 配置里把 min_speech_ms 调到 200ms 以下时，VAD 会切出更短的句子，
+        # 但采集线程只放行 >0.2s 的段（core/pipeline.py 的硬门槛），短句会被静默丢弃。
+        # 默认 250ms 不受影响；这里给调过配置的人一个看得见的提示。
+        if int(getattr(self.cfg, "min_speech_ms", 250) or 0) < 200:
+            self.lbl_diag.setText(
+                f"min_speech_ms={int(self.cfg.min_speech_ms)}ms 低于 200ms："
+                "采集线程只放行时长 >0.2s 的句子，更短的会被丢弃。建议调回 250ms 以上。")
+            self.lbl_diag.setStyleSheet(f"color:{theme.WARN}; font-size:11px;")
+            return
         if float(getattr(self.cfg, "sensitivity", 0.7) or 0) > 0.92:
             self.lbl_diag.setText("灵敏度接近拉满：背景音乐会被一直算作语音，句子切不开，"
                                   "字幕要等好几秒才出。建议调回 0.7 左右。")
