@@ -116,7 +116,9 @@ class SpeechSegmenter:
             self._last_voiced_wall = time.perf_counter()
             if not self.in_speech:
                 self.in_speech = True
-                self._buf = list(self._pre)
+                # 当前块在上面已经进过 _pre 了，这里要去掉，否则句首这一块会重复一遍
+                # （约 33~100ms 的音频双份，表现为开头轻微口吃，且 _speech_ms 与音频长度对不上）
+                self._buf = list(self._pre)[:-1]
                 self._levels = [float("inf")] * len(self._buf)
                 self._speech_ms = 0
                 self._silence_ms = 0
