@@ -346,8 +346,12 @@ def translate_segments(translator, segments: List[Segment], roster: str = "",
     return done
 
 
-def decode_audio(path: str, sampling_rate: int = SAMPLE_RATE) -> np.ndarray:
+def decode_audio(path: str, sampling_rate: int = SAMPLE_RATE,
+                 should_stop: Optional[Callable[[], bool]] = None) -> np.ndarray:
     """把任意音视频文件解成单声道 16k float32 PCM。
+
+    `should_stop` 用于取消：长视频解码要几十秒，逐帧检查，命中就立刻返回空数组
+    （否则点了取消还要等整段解完才停，界面看起来像卡死）。
 
     不复用 faster-whisper 自带的 decode_audio：它给 `av.open` 传了
     metadata_errors="ignore"，而 PyAV 19 已经删掉这个参数（实时字幕只喂内存
@@ -377,6 +381,8 @@ def decode_audio(path: str, sampling_rate: int = SAMPLE_RATE) -> np.ndarray:
         stream = container.streams.audio[0]
         stream.thread_type = "AUTO"
         for frame in container.decode(stream):
+            if should_stop is not None and should_stop():
+                return np.zeros(0, dtype=np.float32)
             _take(resampler.resample(frame))
         _take(resampler.resample(None))     # 冲掉重采样器里剩下的尾巴
 
@@ -435,7 +441,12 @@ def transcribe_media(asr, path: str, language: Optional[str] = "ja",
     if want_words:
         kwargs["word_timestamps"] = True
 
-    audio = decode_audio(path)
+    if should_stop is not None and should_stop():
+        return [], 0.0
+    audio = decode_audio(path, should_stop=should_stop)
+    # 解码被取消：直接返回空结果，别把「解出 0 字节」误报成文件损坏
+    if should_stop is not None and should_stop():
+        return [], 0.0
     if audio.size == 0:
         raise RuntimeError("没有解出音频内容，确认文件没损坏、也不是纯图片/纯文本")
 
