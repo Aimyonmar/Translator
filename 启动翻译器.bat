@@ -18,9 +18,9 @@ if not exist "%PYCON%" (
 )
 
 rem 首次启动：模型没缓存过就先下载，进度直接显示在这个窗口里
-set "MODELDIR=%~dp0.runtime\hf\hub"
-if defined HF_HOME set "MODELDIR=%HF_HOME%\hub"
-dir /b "%MODELDIR%\models--Systran--faster-whisper-*" >nul 2>&1
+rem 缓存判定交给 准备模型.py：turbo / kotoba 的仓库名不是 Systran，
+rem 写死 models--Systran--faster-whisper-* 会把已缓存的它们误判成「首次启动」
+"%PYCON%" "%~dp0准备模型.py" --check >nul 2>&1
 if errorlevel 1 (
     echo   ============================================
     echo    首次启动：需要下载语音识别模型

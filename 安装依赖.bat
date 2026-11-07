@@ -16,9 +16,16 @@ echo   需要：Python 3.10 ~ 3.13（64 位）
 echo ============================================
 echo.
 
+rem python.exe 存在不等于环境可用：建 venv 的 Python 被卸载/升级后，
+rem pyvenv.cfg 指向的目录已经不在了，pip 会一直失败（提示网络/磁盘都不是原因）
 if exist "%PY%" (
-    echo   检测到已有虚拟环境，直接检查/补齐依赖。
-    goto :install
+    "%PY%" -c "import sys" >nul 2>&1
+    if not errorlevel 1 (
+        echo   检测到已有虚拟环境，直接检查/补齐依赖。
+        goto :install
+    )
+    echo   [!] 虚拟环境已损坏（建它的 Python 可能已被卸载或升级），正在重建…
+    rmdir /s /q "%VENV%" >nul 2>&1
 )
 
 rem ---------- 1) 找一个可用的 Python（优先 3.12/3.11/3.10/3.13） ----------

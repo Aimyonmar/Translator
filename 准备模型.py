@@ -8,9 +8,13 @@ faster-whisper 的下载进度条会被吞掉，用户只看到「正在加载�
 用法（在项目根目录）：
     .runtime\\venv\\Scripts\\python.exe 准备模型.py
     .runtime\\venv\\Scripts\\python.exe 准备模型.py medium
+    .runtime\\venv\\Scripts\\python.exe 准备模型.py --check
 
 不带参数时读 config.json 的 model_size；没有配置就用默认 small。
 已缓存时直接跳过，不会重复下载。
+`--check` 只判断当前配置的模型是否已完整缓存：已缓存返回 0，否则返回 1，
+供「启动翻译器.bat」决定要不要弹下载 —— 缓存目录名由 core.model_store 统一决定，
+turbo / kotoba 的仓库名不是 Systran，写死前缀会误判。
 """
 from __future__ import annotations
 
@@ -31,12 +35,14 @@ for _stream in (sys.stdout, sys.stderr):
 
 # 模型仓库体积（MB）与缓存判定统一由 core.model_store 提供：面板、asr、
 # 本脚本共用一套，避免两处表各写一份、越走越偏
-from core.model_store import EST_SIZE_MB as SIZE_MB, snapshot_dir
+from core.model_store import EST_SIZE_MB as SIZE_MB, repo_id, snapshot_dir
 
 
 def _pick_model() -> str:
-    if len(sys.argv) > 1:
-        return sys.argv[1].strip()
+    # 跳过 --check 这类开关，别把参数名当成型号
+    for arg in sys.argv[1:]:
+        if not arg.startswith("-"):
+            return arg.strip()
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             size = (json.load(f) or {}).get("model_size")
@@ -73,7 +79,16 @@ def main() -> int:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
     size = _pick_model()
-    repo = f"Systran/faster-whisper-{size}"
+    # --check：只回答「当前配置的模型是否已完整缓存」，不打印、不联网。
+    # 启动脚本用它判断要不要走下载流程；仓库名/缓存目录都交给 model_store，
+    # 避免在这里硬拼 Systran 前缀（turbo、kotoba 不在 Systran 名下）。
+    if "--check" in sys.argv:
+        cached = _cached_path(size)
+        if cached:
+            print(cached)
+        return 0 if cached else 1
+
+    repo = repo_id(size)
     mb = SIZE_MB.get(size)
     cache = os.path.join(os.environ["HF_HOME"], "hub")
 
