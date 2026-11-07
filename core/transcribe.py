@@ -8,8 +8,10 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -20,6 +22,10 @@ SAMPLE_RATE = 16000
 
 # 句段：兼容旧的 (起始秒, 结束秒, 文本) 元组（实时记录导出仍在用）
 Segment = Tuple[float, float, str]
+
+# 工程文件格式版本：字段一旦对外就不要再改含义，只能加字段
+PROJECT_SCHEMA = "translator-project/1"
+
 
 @dataclass
 class Cue:
@@ -130,6 +136,49 @@ def to_ass(segments: List[Segment], title: str = "Translator",
     return head + "".join(lines)
 
 
+def to_project_json(segments: List[Segment], media_path: str = "",
+                    duration: float = 0.0, language: str = "", model: str = "",
+                    device: str = "", beam_size: int = 0,
+                    word_timestamps: bool = True) -> str:
+    """工程 JSON：转写结果的完整落盘格式，供后续批量转写 / 校对 / 再导出直接读取。
+
+    字段约定（只增不改）：
+    - `schema`：格式版本，当前 `translator-project/1`；
+    - `media`：源文件路径、文件名、时长、语种；
+    - `asr`：模型/设备/解码宽度/是否带字词时间码（复现与对比用）；
+    - `cues`：与 SRT 一一对应的句，`words` 挂在句上（无字词时间码时为空数组）。
+    """
+    cues = []
+    for i, seg in enumerate(segments, 1):
+        a, b, t = _span(seg)
+        cues.append({
+            "i": i,
+            "start": round(a, 3),
+            "end": round(b, 3),
+            "text": t,
+            "tgt": _tgt(seg),
+            "words": list(seg.words) if isinstance(seg, Cue) else [],
+        })
+    data = {
+        "schema": PROJECT_SCHEMA,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "media": {
+            "path": media_path,
+            "name": os.path.basename(media_path),
+            "duration_s": round(float(duration), 3),
+            "language": language,
+        },
+        "asr": {
+            "model": model,
+            "device": device,
+            "beam_size": int(beam_size),
+            "word_timestamps": bool(word_timestamps),
+        },
+        "cues": cues,
+    }
+    return json.dumps(data, ensure_ascii=False, indent=1)
+
+
 def decode_audio(path: str, sampling_rate: int = SAMPLE_RATE) -> np.ndarray:
     """把任意音视频文件解成单声道 16k float32 PCM。
 
@@ -180,8 +229,18 @@ def _apply_fixes(text: str, word_map: str, roster: str) -> str:
     return text
 
 
+def _words_supported(model) -> bool:
+    """老版本 faster-whisper 的 transcribe 没有 word_timestamps 参数。"""
+    try:
+        import inspect
+        return "word_timestamps" in inspect.signature(model.transcribe).parameters
+    except Exception:
+        return False
+
+
 def transcribe_media(asr, path: str, language: Optional[str] = "ja",
                      word_map: str = "", roster: str = "",
+                     word_timestamps: bool = True,
                      on_progress: Optional[Callable[[int], None]] = None,
                      should_stop: Optional[Callable[[], bool]] = None
                      ) -> Tuple[List[Cue], float]:
@@ -189,6 +248,7 @@ def transcribe_media(asr, path: str, language: Optional[str] = "ja",
 
     复用已经加载好的实时模型（asr.model），不另起一份 —— 两份模型同时驻留显存
     正是「与实时字幕互斥」要避免的情况。调用方负责保证模型已 load。
+    `word_timestamps=True` 时每句额外带上字词时间码（供工程 JSON 与重新断句用）。
     """
     if asr.model is None:
         raise RuntimeError("模型尚未加载")
@@ -204,6 +264,9 @@ def transcribe_media(asr, path: str, language: Optional[str] = "ja",
     )
     if _batch_supported() and getattr(asr, "batch_size", 1) > 1:
         kwargs["batch_size"] = asr.batch_size
+    want_words = bool(word_timestamps) and _words_supported(asr.model)
+    if want_words:
+        kwargs["word_timestamps"] = True
 
     audio = decode_audio(path)
     if audio.size == 0:
@@ -221,7 +284,18 @@ def transcribe_media(asr, path: str, language: Optional[str] = "ja",
 
             if text:
                 text = _apply_fixes(text, word_map, roster)
-                segments.append(Cue(float(seg.start), float(seg.end), text))
+                words = []
+                if want_words:
+                    for w in (getattr(seg, "words", None) or []):
+                        wt = (getattr(w, "word", "") or "").strip()
+                        if wt:
+                            words.append({
+                                "s": round(float(w.start), 3),
+                                "e": round(float(w.end), 3),
+                                "t": wt,
+                                "p": round(float(getattr(w, "probability", 0.0) or 0.0), 3),
+                            })
+                segments.append(Cue(float(seg.start), float(seg.end), text, words))
             if on_progress is not None and total > 0:
                 # 留 1% 给收尾（写文件、刷新界面），别让进度条卡在 100% 等
                 on_progress(min(99, int(float(seg.end) / total * 100)))

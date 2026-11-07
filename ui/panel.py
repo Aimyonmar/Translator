@@ -711,12 +711,15 @@ class ControlPanel(QWidget):
         self.btn_trs_txt = QPushButton("TXT")
         self.btn_trs_srt = QPushButton("SRT")
         self.btn_trs_ass = QPushButton("ASS")
-        self._trs_export_btns = (self.btn_trs_txt, self.btn_trs_srt, self.btn_trs_ass)
+        self.btn_trs_json = QPushButton("工程 JSON")
+        self._trs_export_btns = (self.btn_trs_txt, self.btn_trs_srt, self.btn_trs_ass,
+                                 self.btn_trs_json)
         for b in self._trs_export_btns:
             b.setEnabled(False)
         self.btn_trs_txt.clicked.connect(lambda: self._export_trs("txt"))
         self.btn_trs_srt.clicked.connect(lambda: self._export_trs("srt"))
         self.btn_trs_ass.clicked.connect(lambda: self._export_trs("ass"))
+        self.btn_trs_json.clicked.connect(lambda: self._export_trs("json"))
         for b in self._trs_export_btns:
             row3.addWidget(b)
         row3.addStretch(1)
@@ -1270,10 +1273,10 @@ class ControlPanel(QWidget):
             b.setEnabled(True)
         if cancelled:
             self.lbl_trs_state.setText(
-                f"已取消：保留已转出的 {len(segments)} 句，仍可导出 TXT / SRT / ASS。")
+                f"已取消：保留已转出的 {len(segments)} 句，仍可导出 TXT / SRT / ASS / 工程 JSON。")
         else:
             self.lbl_trs_state.setText(
-                f"完成：{len(segments)} 句 · 音频时长 {format_ts(total)}；可导出 TXT / SRT / ASS。")
+                f"完成：{len(segments)} 句 · 音频时长 {format_ts(total)}；可导出 TXT / SRT / ASS / 工程 JSON。")
 
     def _on_trs_fail(self, msg: str) -> None:
         self.set_transcribing(False)
@@ -1283,10 +1286,11 @@ class ControlPanel(QWidget):
     def _export_trs(self, kind: str) -> None:
         if not self._trs_segments:
             return
-        from core.transcribe import to_ass, to_srt, to_txt
+        from core.transcribe import to_ass, to_project_json, to_srt, to_txt
         base = os.path.splitext(self._trs_path)[0] or "转写结果"
         filt = {"txt": ("TXT (*.txt)", "txt"), "srt": ("SRT (*.srt)", "srt"),
-                "ass": ("ASS (*.ass)", "ass")}.get(kind, ("SRT (*.srt)", "srt"))
+                "ass": ("ASS (*.ass)", "ass"),
+                "json": ("工程 JSON (*.json)", "json")}.get(kind, ("SRT (*.srt)", "srt"))
         title = os.path.basename(self._trs_path) or "Translator"
         path, _ = QFileDialog.getSaveFileName(
             self, f"导出 {filt[0].split(' (')[0]}", f"{base}.{filt[1]}", filt[0])
@@ -1296,6 +1300,14 @@ class ControlPanel(QWidget):
             data = to_txt(self._trs_segments)
         elif kind == "ass":
             data = to_ass(self._trs_segments, title=title)
+        elif kind == "json":
+            segs = self._trs_segments
+            duration = max((s.end for s in segs), default=0.0)
+            data = to_project_json(
+                segs, media_path=self._trs_path, duration=duration,
+                language=self.cfg.source_lang,
+                model=self.cfg.model_size, device=self.cfg.asr_device,
+                beam_size=5, word_timestamps=any(s.words for s in segs))
         else:
             data = to_srt(self._trs_segments)
         try:
