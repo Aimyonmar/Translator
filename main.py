@@ -373,9 +373,9 @@ class AppController:
                 t0 = time.perf_counter()
                 segments, total = transcribe_media(
                     asr, path,
-                    # "" / auto 表示让 Whisper 自己判语种
-                    language=(None if self.cfg.source_lang in ("", "auto")
-                              else self.cfg.source_lang),
+                    # "" / auto 表示让 Whisper 自己判语种；kotoba 等日语专用档由
+                    # asr.resolve_language() 强制 ja（不能在这里直接传 None 绕开）
+                    language=asr.resolve_language(self.cfg.source_lang),
                     word_map=self.cfg.word_map if namefix else "",
                     roster=self.cfg.name_roster if namefix else "",
                     # 离线多花一点时间换字词时间码：工程 JSON 与重新断句都要用

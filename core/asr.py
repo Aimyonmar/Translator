@@ -146,8 +146,13 @@ class WhisperASR:
         big = size.startswith("large")
         user_ct = self.compute_type if self.compute_type != "auto" else None
         if dev != "cuda":
-            # CPU 上 large-v3 毫无可用性（一句话 15 秒），直接换 small 保实时
-            return [("small" if big else size, "cpu", user_ct or "int8")]
+            # CPU 上 large-v3 毫无可用性（一句话 15 秒），直接换 small 保实时。
+            # 自定义档（kotoba/turbo）不在 faster-whisper 的内置表里，缓存也可能不完整：
+            # 只有这一个组合时一次加载失败就彻底没字幕，所以再补一个 small 兜底。
+            first = ("small" if big else size, "cpu", user_ct or "int8")
+            if first[0] == "small":
+                return [first]
+            return [first, ("small", "cpu", "int8")]
         free = _gpu_free_gb()
         chain: List[tuple] = []
         if big:
@@ -251,6 +256,18 @@ class WhisperASR:
     def _lang(self) -> str:
         """kotoba 等日语专用模型强制 ja；其余沿用配置。"""
         return "ja" if self._force_ja else self.language
+
+    def resolve_language(self, requested: Optional[str] = None) -> Optional[str]:
+        """把调用方请求的语种归一到真正下发给模型的代码（None = 自动检测）。
+
+        kotoba 是日语专用档：必须锁死 ja，不能因为调用方传 None/auto 就退回自动检测，
+        否则离线转写与实时链路的行为会不一致（同一个模型两条路跑出两种语种策略）。
+        """
+        if self._force_ja:
+            return "ja"
+        if requested is None or requested in ("", "auto"):
+            return None
+        return requested
 
     def _smoke(self) -> None:
         """用极短静音跑一次推理：GPU 缺运行库时会在这里就暴露，而不是等到真正识别时。"""
