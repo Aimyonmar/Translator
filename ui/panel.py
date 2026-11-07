@@ -697,8 +697,13 @@ class ControlPanel(QWidget):
         row2.addWidget(self.btn_trs_start, 2)
         row2.addWidget(self.btn_trs_cancel, 1)
         v.addLayout(row2)
-        # 重新断句只影响离线转写：识别完再处理，不进实时链路
+        # 两个可选项都只影响离线转写：识别完再处理，不进实时链路
         row_opt = QHBoxLayout()
+        self.chk_trs_translate = QCheckBox("同时翻译（复用实时通道）")
+        self.chk_trs_translate.setToolTip(
+            "转写完接着逐句翻译，复用实时字幕用的通道、主备补发与译文缓存。\n"
+            "开启后可导出双语 SRT 与单独译文 SRT。")
+        self.chk_trs_translate.toggled.connect(self._on_trs_opts_changed)
         self.spn_trs_chars = QSpinBox()
         self.spn_trs_chars.setRange(0, 200)
         self.spn_trs_chars.setSpecialValueText("不重新断句")
@@ -708,7 +713,9 @@ class ControlPanel(QWidget):
             "把过长的字幕按最大字数切开：优先在标点处下刀，时间码按字词时间码\n"
             "（有就用）或字数比例分配，再送去翻译。0 表示保留原句。")
         self.spn_trs_chars.valueChanged.connect(self._on_trs_opts_changed)
+        self.chk_trs_translate.setChecked(bool(getattr(self.cfg, "trs_translate", False)))
         self.spn_trs_chars.setValue(int(getattr(self.cfg, "trs_max_chars", 0) or 0))
+        row_opt.addWidget(self.chk_trs_translate, 1)
         row_opt.addWidget(QLabel("单句最多"))
         row_opt.addWidget(self.spn_trs_chars)
         row_opt.addWidget(QLabel("字"))
@@ -728,14 +735,18 @@ class ControlPanel(QWidget):
         self.btn_trs_txt = QPushButton("TXT")
         self.btn_trs_srt = QPushButton("SRT")
         self.btn_trs_ass = QPushButton("ASS")
+        self.btn_trs_bi = QPushButton("双语 SRT")
+        self.btn_trs_tsrt = QPushButton("译文 SRT")
         self.btn_trs_json = QPushButton("工程 JSON")
         self._trs_export_btns = (self.btn_trs_txt, self.btn_trs_srt, self.btn_trs_ass,
-                                 self.btn_trs_json)
+                                 self.btn_trs_bi, self.btn_trs_tsrt, self.btn_trs_json)
         for b in self._trs_export_btns:
             b.setEnabled(False)
         self.btn_trs_txt.clicked.connect(lambda: self._export_trs("txt"))
         self.btn_trs_srt.clicked.connect(lambda: self._export_trs("srt"))
         self.btn_trs_ass.clicked.connect(lambda: self._export_trs("ass"))
+        self.btn_trs_bi.clicked.connect(lambda: self._export_trs("srt2"))
+        self.btn_trs_tsrt.clicked.connect(lambda: self._export_trs("tsrt"))
         self.btn_trs_json.clicked.connect(lambda: self._export_trs("json"))
         for b in self._trs_export_btns:
             row3.addWidget(b)
@@ -1238,7 +1249,8 @@ class ControlPanel(QWidget):
         self.lbl_trs_state.setText("已选择文件，点「开始转写」。")
 
     def _on_trs_opts_changed(self, *_args) -> None:
-        """转写选项写回配置：下次启动仍按上次的状态跑。"""
+        """转写选项写回配置：下次启动仍按上次勾选的状态跑。"""
+        self.cfg.trs_translate = bool(self.chk_trs_translate.isChecked())
         self.cfg.trs_max_chars = int(self.spn_trs_chars.value())
         self.cfg.save()
 
@@ -1261,6 +1273,7 @@ class ControlPanel(QWidget):
         self.lbl_trs_state.setText("正在准备模型…")
         self.ctrl.transcribe_start(
             self._trs_path,
+            translate=bool(self.chk_trs_translate.isChecked()),
             max_chars=int(self.spn_trs_chars.value()),
         )
 
@@ -1284,11 +1297,15 @@ class ControlPanel(QWidget):
                 "没有识别出文字：确认文件里有人声，或换更大的模型再试。")
             return
         self.bar_trs.setValue(100)
+        has_tgt = any(getattr(s, "tgt", "") for s in segments)
         # 长音频可能上万句：预览截断，导出始终是完整内容
         lines = []
         for seg in segments:
             a, b, t = seg.start, seg.end, seg.text
-            lines.append(f"[{format_ts(a)} → {format_ts(b)}] {t}")
+            line = f"[{format_ts(a)} → {format_ts(b)}] {t}"
+            if getattr(seg, "tgt", ""):
+                line += f"\n    {seg.tgt}"
+            lines.append(line)
         shown = lines[:400]
         text = "\n".join(shown)
         if len(lines) > len(shown):
@@ -1296,12 +1313,19 @@ class ControlPanel(QWidget):
         self.txt_trs_result.setPlainText(text)
         for b in self._trs_export_btns:
             b.setEnabled(True)
+        # 没开翻译时这两个按钮导不出东西，直接置灰
+        self.btn_trs_bi.setEnabled(has_tgt)
+        self.btn_trs_tsrt.setEnabled(has_tgt)
+        tail = "；可导出 TXT / SRT / ASS"
+        if has_tgt:
+            tail += " / 双语 SRT / 译文 SRT"
+        tail += " / 工程 JSON。"
         if cancelled:
             self.lbl_trs_state.setText(
-                f"已取消：保留已转出的 {len(segments)} 句，仍可导出 TXT / SRT / ASS / 工程 JSON。")
+                f"已取消：保留已转出的 {len(segments)} 句{tail}")
         else:
             self.lbl_trs_state.setText(
-                f"完成：{len(segments)} 句 · 音频时长 {format_ts(total)}；可导出 TXT / SRT / ASS / 工程 JSON。")
+                f"完成：{len(segments)} 句 · 音频时长 {format_ts(total)}{tail}")
 
     def _on_trs_fail(self, msg: str) -> None:
         self.set_transcribing(False)
@@ -1311,10 +1335,13 @@ class ControlPanel(QWidget):
     def _export_trs(self, kind: str) -> None:
         if not self._trs_segments:
             return
-        from core.transcribe import to_ass, to_project_json, to_srt, to_txt
+        from core.transcribe import (to_ass, to_project_json, to_srt,
+                                     to_translation_srt, to_txt)
         base = os.path.splitext(self._trs_path)[0] or "转写结果"
         filt = {"txt": ("TXT (*.txt)", "txt"), "srt": ("SRT (*.srt)", "srt"),
                 "ass": ("ASS (*.ass)", "ass"),
+                "srt2": ("双语 SRT (*.srt)", "双语.srt"),
+                "tsrt": ("译文 SRT (*.srt)", "译文.srt"),
                 "json": ("工程 JSON (*.json)", "json")}.get(kind, ("SRT (*.srt)", "srt"))
         title = os.path.basename(self._trs_path) or "Translator"
         path, _ = QFileDialog.getSaveFileName(
@@ -1324,7 +1351,12 @@ class ControlPanel(QWidget):
         if kind == "txt":
             data = to_txt(self._trs_segments)
         elif kind == "ass":
-            data = to_ass(self._trs_segments, title=title)
+            data = to_ass(self._trs_segments, title=title,
+                          bilingual=any(s.tgt for s in self._trs_segments))
+        elif kind == "srt2":
+            data = to_srt(self._trs_segments, bilingual=True)
+        elif kind == "tsrt":
+            data = to_translation_srt(self._trs_segments)
         elif kind == "json":
             segs = self._trs_segments
             duration = max((s.end for s in segs), default=0.0)

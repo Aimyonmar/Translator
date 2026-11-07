@@ -106,7 +106,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.audio import list_capture_devices, pick_default_device
 from core.config import AppConfig
 from core.pipeline import Pipeline
-from core.transcribe import resplit, transcribe_media
+from core.transcribe import resplit, transcribe_media, translate_segments
 from ui.overlay import SubtitleOverlay
 from ui.panel import ControlPanel, _icon
 
@@ -344,12 +344,14 @@ class AppController:
         threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ 音频转文字
-    def transcribe_start(self, path: str, max_chars: int = 0) -> None:
+    def transcribe_start(self, path: str, translate: bool = False,
+                         max_chars: int = 0) -> None:
         """整段音视频转文字（后台线程）。
 
         与实时字幕互斥：两者共用 pipeline.asr 里的那一份模型，同时跑会让解码排队、
         显存也顶不住；所以运行中拒绝开始，转写中面板会锁住「开始翻译」。
 
+        translate=True 时转写完接着逐句翻译（复用实时那套通道/主备/缓存）；
         max_chars>0 时先按最大字数重新断句，再翻译，保证两种产物句界一致。
         """
         if self.pipeline.state in ("running", "paused", "loading"):
@@ -387,6 +389,22 @@ class AppController:
                     segments = resplit(segments, max_chars)
                     self.panel.sig_trs_status.emit(
                         f"已重新断句：{n0} → {len(segments)} 句（≤{max_chars} 字）")
+                if translate and segments and not cancel.is_set():
+                    def on_tr(i: int, n: int) -> None:
+                        self.panel.sig_trs_progress.emit(int(i / max(1, n) * 100))
+                        if i % 5 == 0 or i == n:
+                            self.panel.sig_trs_status.emit(f"正在翻译 {i}/{n} 句…")
+
+                    t1 = time.perf_counter()
+                    ok = translate_segments(
+                        self.pipeline.translator, segments,
+                        roster=self.cfg.name_roster if namefix else "",
+                        builtin_titles=bool(getattr(self.cfg, "builtin_titles", True)),
+                        on_progress=on_tr,
+                        should_stop=cancel.is_set,
+                    )
+                    self.panel.sig_trs_status.emit(
+                        f"翻译完成：{ok}/{len(segments)} 句，用时 {time.perf_counter() - t1:.1f}s")
                 self.panel.sig_trs_done.emit((segments, total, cancel.is_set()))
                 if cancel.is_set():
                     self.status(f"已取消转写（保留 {len(segments)} 句）")

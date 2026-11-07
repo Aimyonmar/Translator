@@ -71,18 +71,40 @@ def format_ts(seconds: float, sep: str = ".") -> str:
 
 def to_txt(segments: List[Segment]) -> str:
     """TXT：每行「[起 → 止] 文本」，时间戳保留到毫秒，方便对照原片。"""
-    return "".join(
-        f"[{format_ts(a)} → {format_ts(b)}] {t}\n" for a, b, t in map(_span, segments)
-    )
+    out = []
+    for seg in segments:
+        a, b, t = _span(seg)
+        out.append(f"[{format_ts(a)} → {format_ts(b)}] {t}\n")
+        g = _tgt(seg)
+        if g:
+            out.append(f"    {g}\n")
+    return "".join(out)
 
 
-def to_srt(segments: List[Segment]) -> str:
-    """标准 SRT：序号 + 时间轴 + 文本，播放器/剪辑软件可直接载入。"""
+def to_srt(segments: List[Segment], bilingual: bool = False) -> str:
+    """标准 SRT：序号 + 时间轴 + 文本，播放器/剪辑软件可直接载入。
+
+    bilingual=True 时把译文接在原文下一行（同一句字幕内两行），
+    这是非英语平台/剪辑软件最通用的双语做法。
+    """
     out = []
     for i, seg in enumerate(segments, 1):
         a, b, t = _span(seg)
-        out.append(f"{i}\n{format_ts(a, ',')} --> {format_ts(b, ',')}\n{t}\n")
+        g = _tgt(seg)
+        body = f"{t}\n{g}" if (bilingual and g) else t
+        out.append(f"{i}\n{format_ts(a, ',')} --> {format_ts(b, ',')}\n{body}\n")
     return "\n".join(out)
+
+
+def to_translation_srt(segments: List[Segment]) -> str:
+    """单独译文 SRT：只保留有译文的句子，时间码沿用原句，正文用译文。"""
+    out = []
+    for seg in segments:
+        g = _tgt(seg)
+        if g:
+            a, b, _t = _span(seg)
+            out.append(Cue(a, b, g))
+    return to_srt(out)
 
 
 def _ass_ts(seconds: float) -> str:
@@ -284,6 +306,44 @@ def resplit(segments: List[Segment], max_chars: int) -> List[Cue]:
         if tgt:
             out[-1].tgt = tgt
     return out
+
+
+def translate_segments(translator, segments: List[Segment], roster: str = "",
+                       builtin_titles: bool = True,
+                       on_progress: Optional[Callable[[int, int], None]] = None,
+                       should_stop: Optional[Callable[[], bool]] = None) -> int:
+    """逐句翻译并回填 `Cue.tgt`，返回成功的句数。
+
+    完全复用 `Translator.translate()`：通道顺序、主备补发、译文缓存、本地口语表、
+    日语归一 / 外来语替换 / 中文润色都在里面，这里不重复实现。
+    标题术语替换与实时链路保持一致（机翻不认识游戏名）。
+    """
+    total = len(segments)
+    done = 0
+    for i, seg in enumerate(segments, 1):
+        if should_stop is not None and should_stop():
+            break
+        src = _span(seg)[2]
+        if not src:
+            continue
+        send = src
+        if roster or builtin_titles:
+            try:
+                from .namefix import apply_title_glossary
+                send = apply_title_glossary(src, roster, builtin=builtin_titles)
+            except Exception:
+                send = src
+        try:
+            out = translator.translate(send)
+        except Exception:
+            out = None
+        if out:
+            if isinstance(seg, Cue):
+                seg.tgt = out
+            done += 1
+        if on_progress is not None:
+            on_progress(i, total)
+    return done
 
 
 def decode_audio(path: str, sampling_rate: int = SAMPLE_RATE) -> np.ndarray:

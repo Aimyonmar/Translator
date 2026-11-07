@@ -103,6 +103,8 @@ class AppConfig:
     last_channel: str = ""
     # 音频转文字：上次选文件的目录，下次打开对话框直接落在这里
     transcribe_dir: str = ""
+    # 文件转写：是否顺带翻译（复用实时那套通道/主备/缓存），默认关，避免无谓的网络耗时
+    trs_translate: bool = False
     # 文件转写：按最大字数重新断句，0 = 不重新断句
     trs_max_chars: int = 0
     # 实时记录导出目录：留空时导出到「文档」，成功后自动记住
