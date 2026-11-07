@@ -354,6 +354,9 @@ class AppController:
         translate=True 时转写完接着逐句翻译（复用实时那套通道/主备/缓存）；
         max_chars>0 时先按最大字数重新断句，再翻译，保证两种产物句界一致。
         """
+        if getattr(self.panel, "_mdl_busy", None):
+            self.panel.sig_trs_fail.emit("正在下载/卸载模型，等它完成再开始转写。")
+            return
         if self.pipeline.state in ("running", "paused", "loading"):
             self.panel.sig_trs_fail.emit("实时字幕正在运行，先停止翻译再转写。")
             return
@@ -423,6 +426,9 @@ class AppController:
             self.panel.sig_trs_status.emit("正在取消…（当前这句转完就停）")
 
     def toggle_start(self) -> None:
+        if getattr(self.panel, "_mdl_busy", None):
+            self.status("正在下载/卸载模型，等它完成再开始实时翻译")
+            return
         if self._trs_busy:
             self.status("正在转写文件，先点「转写」页的「取消」再开始实时翻译")
             return

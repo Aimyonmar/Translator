@@ -921,6 +921,10 @@ class ControlPanel(QWidget):
         if self._mdl_busy:
             self._log("已有模型下载/卸载任务在进行，等它结束再操作")
             return
+        # 实时/转写正在用这份模型：此时删文件会把正在跑的识别器弄坏
+        if self._running or self._transcribing:
+            self._log("实时字幕或转写正在运行，先停止再下载/卸载模型")
+            return
         # 点下去时再判一次：状态可能刚被别处改过，已下载绝不触发下载
         if model_store.is_downloaded(size):
             used = model_store.size_bytes(size) / (1024 * 1024)
@@ -938,6 +942,11 @@ class ControlPanel(QWidget):
             action = "download"
         self._mdl_busy = size
         self._refresh_models()
+        # 下载/卸载期间同样不许开始：同一份模型目录可能一边被删/写、一边被加载
+        self.btn_start.setEnabled(False)
+        self.btn_trs_start.setEnabled(False)
+        self.cmb_model.setEnabled(False)
+        self.cmb_dev.setEnabled(False)
         threading.Thread(target=self._mdl_task, args=(size, action), daemon=True).start()
 
     def _mdl_task(self, size: str, action: str) -> None:
@@ -958,19 +967,35 @@ class ControlPanel(QWidget):
 
     def _on_mdl_done(self) -> None:
         self._mdl_busy = None
+        self._restore_start_enabled()
         self._refresh_models()
 
     def _on_mdl_fail(self, msg: str) -> None:
         self._log(msg)
         self._mdl_busy = None
+        self._restore_start_enabled()
         self._refresh_models()
         QMessageBox.warning(self, "模型缓存", msg)
 
+    def _restore_start_enabled(self) -> None:
+        """模型缓存任务结束后恢复按钮：按当前「运行中 / 转写中」决定谁能点。"""
+        idle = not self._running and not self._transcribing
+        self.btn_start.setEnabled(not self._transcribing)
+        self.btn_trs_start.setEnabled(idle)
+        self.cmb_model.setEnabled(idle)
+        self.cmb_dev.setEnabled(idle)
+
     def _release_loaded(self, size: str) -> None:
-        """卸载前释放已加载的同名模型，避免 Windows 上缓存文件被占用。"""
+        """卸载前释放已加载的同名模型，避免 Windows 上缓存文件被占用。
+
+        必须看 `_loaded_size`（真正加载进内存的那一档）：`model_size` 会被
+        `Pipeline.update_asr()` 改成用户刚在面板选的新值，用它判断会漏掉仍在内存里的
+        旧模型，rmtree 直接报 WinError 32（缓存被删一半变成「未下载（残留）」）。
+        """
         try:
             asr = getattr(getattr(self.ctrl, "pipeline", None), "asr", None)
-            if asr is not None and getattr(asr, "model_size", None) == size:
+            loaded = getattr(asr, "_loaded_size", None)
+            if asr is not None and loaded == size:
                 asr.unload()
         except Exception:
             pass
