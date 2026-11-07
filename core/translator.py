@@ -350,6 +350,9 @@ class Translator:
         # 先查本地口语表：命中就是 0ms，且译文是人工校准过的，比任何免费机翻都准
         with self.lock:
             if cache_key in self._cache:
+                # 命中要移到队尾：淘汰走 popitem(last=False)，不刷新就是按写入顺序的 FIFO，
+                # 反复出现的口头禅会被一次性新句挤掉，白白重发请求
+                self._cache.move_to_end(cache_key)
                 return self._cache[cache_key]
             hit = phrase_lookup(text)
             if hit:
