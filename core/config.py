@@ -103,6 +103,8 @@ class AppConfig:
     last_channel: str = ""
     # 音频转文字：上次选文件的目录，下次打开对话框直接落在这里
     transcribe_dir: str = ""
+    # 文件转写：按最大字数重新断句，0 = 不重新断句
+    trs_max_chars: int = 0
     # 实时记录导出目录：留空时导出到「文档」，成功后自动记住
     export_dir: str = ""
     # 音频预处理：轻量谱减法降噪，压低稳态背景噪声（风扇/电流声/低频隆隆）。
@@ -177,6 +179,7 @@ class AppConfig:
         "auto_clear_sec": (0.0, 600.0, float),
         "window_width": (0, 10000, int),
         "screen_index": (0, 16, int),
+        "trs_max_chars": (0, 200, int),
     }
 
     _STR_FIELDS = (

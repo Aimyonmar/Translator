@@ -697,6 +697,23 @@ class ControlPanel(QWidget):
         row2.addWidget(self.btn_trs_start, 2)
         row2.addWidget(self.btn_trs_cancel, 1)
         v.addLayout(row2)
+        # 重新断句只影响离线转写：识别完再处理，不进实时链路
+        row_opt = QHBoxLayout()
+        self.spn_trs_chars = QSpinBox()
+        self.spn_trs_chars.setRange(0, 200)
+        self.spn_trs_chars.setSpecialValueText("不重新断句")
+        self.spn_trs_chars.setValue(0)
+        self.spn_trs_chars.setFixedWidth(110)
+        self.spn_trs_chars.setToolTip(
+            "把过长的字幕按最大字数切开：优先在标点处下刀，时间码按字词时间码\n"
+            "（有就用）或字数比例分配，再送去翻译。0 表示保留原句。")
+        self.spn_trs_chars.valueChanged.connect(self._on_trs_opts_changed)
+        self.spn_trs_chars.setValue(int(getattr(self.cfg, "trs_max_chars", 0) or 0))
+        row_opt.addWidget(QLabel("单句最多"))
+        row_opt.addWidget(self.spn_trs_chars)
+        row_opt.addWidget(QLabel("字"))
+        row_opt.addStretch(1)
+        v.addLayout(row_opt)
         self.bar_trs = QProgressBar()
         self.bar_trs.setRange(0, 100)
         self.bar_trs.setValue(0)
@@ -1220,6 +1237,11 @@ class ControlPanel(QWidget):
             b.setEnabled(False)
         self.lbl_trs_state.setText("已选择文件，点「开始转写」。")
 
+    def _on_trs_opts_changed(self, *_args) -> None:
+        """转写选项写回配置：下次启动仍按上次的状态跑。"""
+        self.cfg.trs_max_chars = int(self.spn_trs_chars.value())
+        self.cfg.save()
+
     def _on_trs_start(self) -> None:
         if not self._trs_path:
             QMessageBox.information(self, "音频转文字", "先点「选择文件…」选一个音频或视频文件。")
@@ -1237,7 +1259,10 @@ class ControlPanel(QWidget):
         self.bar_trs.setValue(0)
         self.set_transcribing(True)
         self.lbl_trs_state.setText("正在准备模型…")
-        self.ctrl.transcribe_start(self._trs_path)
+        self.ctrl.transcribe_start(
+            self._trs_path,
+            max_chars=int(self.spn_trs_chars.value()),
+        )
 
     def _on_trs_cancel(self) -> None:
         self.ctrl.transcribe_cancel()

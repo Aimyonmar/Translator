@@ -179,6 +179,113 @@ def to_project_json(segments: List[Segment], media_path: str = "",
     return json.dumps(data, ensure_ascii=False, indent=1)
 
 
+# 断句优先在这些字符之后下刀（中日英标点）
+_CUT_PUNCT = "、。，．！？!?,;；:：…"
+# 没有标点时的次选：切在助词**前**，避免把词/短语从中间劈开
+_CUT_PARTICLES = "はがをにでともへのや"
+
+
+def _split_text(text: str, max_chars: int) -> List[str]:
+    """把一句切成每段 ≤ max_chars，优先级：标点 > 空格 > 助词前 > 硬切。
+
+    标点之后永远是最自然的边界，所以标点不设下限；只有退到空格/助词/硬切时
+    才要求切点落在后半段（floor），否则会切出大量极短的碎片。
+    """
+    out: List[str] = []
+    rest = (text or "").strip()
+    floor = max(2, int(max_chars * 0.5))
+    while len(rest) > max_chars:
+        window = rest[:max_chars]
+        cut = -1
+        for i in range(len(window) - 1, 0, -1):
+            if window[i] in _CUT_PUNCT:
+                cut = i + 1
+                break
+        if cut < 0:
+            for i in range(len(window) - 1, floor - 1, -1):
+                if window[i] == " ":
+                    cut = i + 1
+                    break
+        if cut < 0:
+            for i in range(len(window) - 1, floor - 1, -1):
+                if window[i] in _CUT_PARTICLES:
+                    cut = i          # 助词留在下一段开头
+                    break
+        if cut <= 0:
+            cut = max_chars
+        piece = rest[:cut].strip()
+        if piece:
+            out.append(piece)
+        rest = rest[cut:].strip()
+    if rest:
+        out.append(rest)
+    return out
+
+
+def _time_at(offset: int, words: List[dict], start: float, end: float,
+             total_chars: int) -> float:
+    """把「第几个字符」映射成时间：有字词时间码按词内线性插值，否则按字数比例。"""
+    if not words:
+        return start + (end - start) * (offset / max(1, total_chars))
+    cum = 0
+    for w in words:
+        n = len(str(w.get("t", "")).strip())
+        if n <= 0:
+            continue
+        prev, cum = cum, cum + n
+        if offset <= cum:
+            ws = float(w.get("s", start))
+            we = float(w.get("e", end))
+            if offset <= prev:
+                return ws
+            return ws + (we - ws) * ((offset - prev) / n)
+    return end
+
+
+def resplit(segments: List[Segment], max_chars: int) -> List[Cue]:
+    """按最大字数重新断句，返回新的 Cue 列表（不改动传入对象）。
+
+    时间分配方式：
+    1. 句内**有字词时间码**时，切点落在词边界，词内按字符位置线性插值，
+       并把落在该段的字词时间码一起搬过去（工程 JSON 仍可精修）；
+    2. **没有**字词时间码时，按各段字数比例均分整句时长。
+    两种情况都保证时间码单调、不重叠、不超出原句范围。
+    """
+    if not max_chars or max_chars <= 0:
+        return list(segments)
+    out: List[Cue] = []
+    for seg in segments:
+        a, b, t = _span(seg)
+        words = list(seg.words) if isinstance(seg, Cue) else []
+        tgt = _tgt(seg)
+        chunks = _split_text(t, max_chars)
+        if len(chunks) <= 1:
+            out.append(Cue(a, b, t, words, tgt))
+            continue
+        total_chars = max(1, sum(len(c) for c in chunks))
+        # 字词的字符区间，用来把每个词分给对应的那一段
+        word_spans: List[Tuple[int, int, dict]] = []
+        cum = 0
+        for w in words:
+            n = len(str(w.get("t", "")).strip())
+            if n > 0:
+                word_spans.append((cum, cum + n, w))
+                cum += n
+        prev_t, char_pos = a, 0
+        for i, c in enumerate(chunks):
+            c0, char_pos = char_pos, char_pos + len(c)
+            t_end = b if i == len(chunks) - 1 else _time_at(char_pos, words, a, b, total_chars)
+            if t_end <= prev_t:
+                t_end = min(b, prev_t + 0.01)
+            part = [w for ws, we, w in word_spans if c0 <= (ws + we) / 2 < char_pos]
+            out.append(Cue(prev_t, t_end, c, part, ""))
+            prev_t = t_end
+        # 译文无法安全切分：挂在最后一段，避免前半句被误认为已有完整译文
+        if tgt:
+            out[-1].tgt = tgt
+    return out
+
+
 def decode_audio(path: str, sampling_rate: int = SAMPLE_RATE) -> np.ndarray:
     """把任意音视频文件解成单声道 16k float32 PCM。
 

@@ -106,7 +106,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.audio import list_capture_devices, pick_default_device
 from core.config import AppConfig
 from core.pipeline import Pipeline
-from core.transcribe import transcribe_media
+from core.transcribe import resplit, transcribe_media
 from ui.overlay import SubtitleOverlay
 from ui.panel import ControlPanel, _icon
 
@@ -344,11 +344,13 @@ class AppController:
         threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ 音频转文字
-    def transcribe_start(self, path: str) -> None:
+    def transcribe_start(self, path: str, max_chars: int = 0) -> None:
         """整段音视频转文字（后台线程）。
 
         与实时字幕互斥：两者共用 pipeline.asr 里的那一份模型，同时跑会让解码排队、
         显存也顶不住；所以运行中拒绝开始，转写中面板会锁住「开始翻译」。
+
+        max_chars>0 时先按最大字数重新断句，再翻译，保证两种产物句界一致。
         """
         if self.pipeline.state in ("running", "paused", "loading"):
             self.panel.sig_trs_fail.emit("实时字幕正在运行，先停止翻译再转写。")
@@ -366,6 +368,7 @@ class AppController:
                 asr.load(on_progress=self.panel.sig_trs_status.emit)
                 self.status(f"开始转写：{os.path.basename(path)}")
                 namefix = bool(self.cfg.enable_namefix)
+                t0 = time.perf_counter()
                 segments, total = transcribe_media(
                     asr, path,
                     # "" / auto 表示让 Whisper 自己判语种
@@ -373,14 +376,22 @@ class AppController:
                               else self.cfg.source_lang),
                     word_map=self.cfg.word_map if namefix else "",
                     roster=self.cfg.name_roster if namefix else "",
+                    # 离线多花一点时间换字词时间码：工程 JSON 与重新断句都要用
+                    word_timestamps=True,
                     on_progress=self.panel.sig_trs_progress.emit,
                     should_stop=cancel.is_set,
                 )
+                t_asr = time.perf_counter() - t0
+                if max_chars and segments:
+                    n0 = len(segments)
+                    segments = resplit(segments, max_chars)
+                    self.panel.sig_trs_status.emit(
+                        f"已重新断句：{n0} → {len(segments)} 句（≤{max_chars} 字）")
                 self.panel.sig_trs_done.emit((segments, total, cancel.is_set()))
                 if cancel.is_set():
                     self.status(f"已取消转写（保留 {len(segments)} 句）")
                 else:
-                    self.status(f"转写完成：{len(segments)} 句")
+                    self.status(f"转写完成：{len(segments)} 句，识别耗时 {t_asr:.1f}s")
             except Exception as exc:
                 self.panel.sig_trs_fail.emit(f"转写失败：{type(exc).__name__}: {exc}")
             finally:
