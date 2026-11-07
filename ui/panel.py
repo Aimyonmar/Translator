@@ -72,6 +72,9 @@ class ControlPanel(QWidget):
         self._transcribing = False
         self._trs_path = ""
         self._trs_segments: List[tuple] = []
+        # 音频真实总时长（解码得到的 info.duration），工程 JSON 的 duration_s 用它，
+        # 不能用「最后一句结束时间」——尾部静音会让时长偏短
+        self._trs_total = 0.0
         # 实时记录：(起始秒, 结束秒, 原文, 译文)，按上屏顺序追加，只在内存里累积。
         # 用流水线的 seq 对齐：原文先到（记起始时间），译文后到（补该行并收尾）。
         self._live_records: List[Tuple[float, float, str, str]] = []
@@ -1264,6 +1267,7 @@ class ControlPanel(QWidget):
         """换源文件时清掉上一次结果：别让旧文本被导出成新文件的字幕。"""
         self._trs_path = path
         self._trs_segments = []
+        self._trs_total = 0.0
         self.lbl_trs_file.setText(os.path.basename(path))
         self.lbl_trs_file.setToolTip(path)
         self.lbl_trs_out.setText(f"导出目录：{os.path.dirname(path)}")
@@ -1291,6 +1295,7 @@ class ControlPanel(QWidget):
             return
         self.txt_trs_result.clear()
         self._trs_segments = []
+        self._trs_total = 0.0
         for b in self._trs_export_btns:
             b.setEnabled(False)
         self.bar_trs.setValue(0)
@@ -1315,6 +1320,7 @@ class ControlPanel(QWidget):
         from core.transcribe import format_ts
         segments, total, cancelled = payload
         self._trs_segments = list(segments)
+        self._trs_total = float(total or 0.0)
         self.set_transcribing(False)
         if not segments:
             self.lbl_trs_state.setText(
@@ -1384,11 +1390,22 @@ class ControlPanel(QWidget):
             data = to_translation_srt(self._trs_segments)
         elif kind == "json":
             segs = self._trs_segments
-            duration = max((s.end for s in segs), default=0.0)
+            # 元数据写「这次实际用的」：load() 可能已按显存降级到 small，
+            # 设备也可能从 auto 落到具体值；duration 用解码出的音频总时长
+            asr = getattr(getattr(self.ctrl, "pipeline", None), "asr", None)
+            loaded = getattr(asr, "_loaded_size", None) or getattr(asr, "model_size", None)
+            model = loaded or self.cfg.model_size
+            device = getattr(asr, "dev_info", "") or self.cfg.asr_device
+            if getattr(asr, "_force_ja", False):
+                language = "ja"
+            elif self.cfg.source_lang in ("", "auto"):
+                language = "auto"
+            else:
+                language = self.cfg.source_lang
+            duration = self._trs_total or max((s.end for s in segs), default=0.0)
             data = to_project_json(
                 segs, media_path=self._trs_path, duration=duration,
-                language=self.cfg.source_lang,
-                model=self.cfg.model_size, device=self.cfg.asr_device,
+                language=language, model=model, device=device,
                 beam_size=5, word_timestamps=any(s.words for s in segs))
         else:
             data = to_srt(self._trs_segments)
