@@ -654,10 +654,13 @@ class ControlPanel(QWidget):
         self.btn_live_clear = QPushButton("清空")
         self.btn_live_txt = QPushButton("导出 TXT")
         self.btn_live_srt = QPushButton("导出 SRT")
+        self.btn_live_ass = QPushButton("导出 ASS")
         self.btn_live_clear.clicked.connect(self._on_live_clear)
         self.btn_live_txt.clicked.connect(lambda: self._export_live("txt"))
         self.btn_live_srt.clicked.connect(lambda: self._export_live("srt"))
-        for b in (self.btn_live_clear, self.btn_live_txt, self.btn_live_srt):
+        self.btn_live_ass.clicked.connect(lambda: self._export_live("ass"))
+        for b in (self.btn_live_clear, self.btn_live_txt, self.btn_live_srt,
+                  self.btn_live_ass):
             b.setEnabled(False)
             row_live.addWidget(b)
         v_live.addLayout(row_live)
@@ -700,17 +703,23 @@ class ControlPanel(QWidget):
         v.addWidget(self.bar_trs)
         self.lbl_trs_state = QLabel("选好文件后点「开始转写」；与实时字幕互斥，不能同时跑。")
         self.lbl_trs_state.setObjectName("hint")
-        # 导出按钮跟状态行放一起：结果再长也不会把「导出」挤到可视区外
+        self.lbl_trs_state.setWordWrap(True)
+        v.addWidget(self.lbl_trs_state)
+        # 导出按钮单独一行：格式变多以后和状态行挤在一起会互相压缩
         row3 = QHBoxLayout()
-        row3.addWidget(self.lbl_trs_state, 1)
-        self.btn_trs_txt = QPushButton("导出 TXT")
-        self.btn_trs_srt = QPushButton("导出 SRT")
-        self.btn_trs_txt.setEnabled(False)
-        self.btn_trs_srt.setEnabled(False)
+        row3.addWidget(QLabel("导出"))
+        self.btn_trs_txt = QPushButton("TXT")
+        self.btn_trs_srt = QPushButton("SRT")
+        self.btn_trs_ass = QPushButton("ASS")
+        self._trs_export_btns = (self.btn_trs_txt, self.btn_trs_srt, self.btn_trs_ass)
+        for b in self._trs_export_btns:
+            b.setEnabled(False)
         self.btn_trs_txt.clicked.connect(lambda: self._export_trs("txt"))
         self.btn_trs_srt.clicked.connect(lambda: self._export_trs("srt"))
-        row3.addWidget(self.btn_trs_txt)
-        row3.addWidget(self.btn_trs_srt)
+        self.btn_trs_ass.clicked.connect(lambda: self._export_trs("ass"))
+        for b in self._trs_export_btns:
+            row3.addWidget(b)
+        row3.addStretch(1)
         v.addLayout(row3)
         root.addWidget(box_run)
 
@@ -1125,6 +1134,7 @@ class ControlPanel(QWidget):
         self.btn_live_clear.setEnabled(has)
         self.btn_live_txt.setEnabled(has)
         self.btn_live_srt.setEnabled(has)
+        self.btn_live_ass.setEnabled(has)
 
     def _live_update_out_label(self) -> None:
         folder = (self.cfg.export_dir or "").strip()
@@ -1148,22 +1158,23 @@ class ControlPanel(QWidget):
         self.btn_live_clear.setEnabled(False)
         self.btn_live_txt.setEnabled(False)
         self.btn_live_srt.setEnabled(False)
+        self.btn_live_ass.setEnabled(False)
 
     def _export_live(self, kind: str) -> None:
-        """导出实时记录：复用 core/transcribe 的 TXT / SRT 格式。
+        """导出实时记录：复用 core/transcribe 的 TXT / SRT / ASS 格式。
 
-        文件名固定为 实时记录_YYYYmmdd_HHMMSS.txt/.srt，目录取配置里的导出目录
+        文件名固定为 实时记录_YYYYmmdd_HHMMSS.txt/.srt/.ass，目录取配置里的导出目录
         （未设置或已失效时落到「文档」，成功导出后写回配置）。
         """
         if not self._live_records:
             return
-        from core.transcribe import to_srt, to_txt
+        from core.transcribe import to_ass, to_srt, to_txt
         segments = []
         for a, b, src, tgt in self._live_records:
-            # SRT/TXT 都复用同一个 Segment 结构；有译文时原文与译文分两行显示
+            # SRT/TXT/ASS 都复用同一个 Segment 结构；有译文时原文与译文分两行显示
             text = f"{src}\n{tgt}" if tgt else src
             segments.append((a, max(a, b), text))
-        data = to_txt(segments) if kind == "txt" else to_srt(segments)
+        data = {"txt": to_txt, "ass": to_ass}.get(kind, to_srt)(segments)
         folder = (self.cfg.export_dir or "").strip()
         if not folder or not os.path.isdir(folder):
             folder = (QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
@@ -1202,8 +1213,8 @@ class ControlPanel(QWidget):
         self.lbl_trs_out.setText(f"导出目录：{os.path.dirname(path)}")
         self.txt_trs_result.clear()
         self.bar_trs.setValue(0)
-        self.btn_trs_txt.setEnabled(False)
-        self.btn_trs_srt.setEnabled(False)
+        for b in self._trs_export_btns:
+            b.setEnabled(False)
         self.lbl_trs_state.setText("已选择文件，点「开始转写」。")
 
     def _on_trs_start(self) -> None:
@@ -1218,8 +1229,8 @@ class ControlPanel(QWidget):
             return
         self.txt_trs_result.clear()
         self._trs_segments = []
-        self.btn_trs_txt.setEnabled(False)
-        self.btn_trs_srt.setEnabled(False)
+        for b in self._trs_export_btns:
+            b.setEnabled(False)
         self.bar_trs.setValue(0)
         self.set_transcribing(True)
         self.lbl_trs_state.setText("正在准备模型…")
@@ -1246,20 +1257,23 @@ class ControlPanel(QWidget):
             return
         self.bar_trs.setValue(100)
         # 长音频可能上万句：预览截断，导出始终是完整内容
-        lines = [f"[{format_ts(a)} → {format_ts(b)}] {t}" for a, b, t in segments]
+        lines = []
+        for seg in segments:
+            a, b, t = seg.start, seg.end, seg.text
+            lines.append(f"[{format_ts(a)} → {format_ts(b)}] {t}")
         shown = lines[:400]
         text = "\n".join(shown)
         if len(lines) > len(shown):
             text += f"\n…（共 {len(lines)} 句，预览只显示前 {len(shown)} 句，导出为完整内容）"
         self.txt_trs_result.setPlainText(text)
-        self.btn_trs_txt.setEnabled(True)
-        self.btn_trs_srt.setEnabled(True)
+        for b in self._trs_export_btns:
+            b.setEnabled(True)
         if cancelled:
             self.lbl_trs_state.setText(
-                f"已取消：保留已转出的 {len(segments)} 句，仍可导出 TXT / SRT。")
+                f"已取消：保留已转出的 {len(segments)} 句，仍可导出 TXT / SRT / ASS。")
         else:
             self.lbl_trs_state.setText(
-                f"完成：{len(segments)} 句 · 音频时长 {format_ts(total)}；可导出 TXT / SRT。")
+                f"完成：{len(segments)} 句 · 音频时长 {format_ts(total)}；可导出 TXT / SRT / ASS。")
 
     def _on_trs_fail(self, msg: str) -> None:
         self.set_transcribing(False)
@@ -1269,14 +1283,21 @@ class ControlPanel(QWidget):
     def _export_trs(self, kind: str) -> None:
         if not self._trs_segments:
             return
-        from core.transcribe import to_srt, to_txt
+        from core.transcribe import to_ass, to_srt, to_txt
         base = os.path.splitext(self._trs_path)[0] or "转写结果"
-        filt = "TXT (*.txt)" if kind == "txt" else "SRT (*.srt)"
+        filt = {"txt": ("TXT (*.txt)", "txt"), "srt": ("SRT (*.srt)", "srt"),
+                "ass": ("ASS (*.ass)", "ass")}.get(kind, ("SRT (*.srt)", "srt"))
+        title = os.path.basename(self._trs_path) or "Translator"
         path, _ = QFileDialog.getSaveFileName(
-            self, f"导出 {kind.upper()}", f"{base}.{kind}", filt)
+            self, f"导出 {filt[0].split(' (')[0]}", f"{base}.{filt[1]}", filt[0])
         if not path:
             return
-        data = to_txt(self._trs_segments) if kind == "txt" else to_srt(self._trs_segments)
+        if kind == "txt":
+            data = to_txt(self._trs_segments)
+        elif kind == "ass":
+            data = to_ass(self._trs_segments, title=title)
+        else:
+            data = to_srt(self._trs_segments)
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(data)
