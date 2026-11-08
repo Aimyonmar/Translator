@@ -10,17 +10,19 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QStandardPaths
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
+from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QFont, QShortcut,
+                          QKeySequence, QTextCursor)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout, QGroupBox, QLabel,
     QComboBox, QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox,
     QPlainTextEdit, QProgressBar, QMessageBox, QLineEdit, QScrollArea, QFrame,
     QApplication, QAbstractSpinBox, QButtonGroup, QStackedWidget, QFileDialog,
-    QDialog,
+    QDialog, QKeySequenceEdit,
 )
 
-from core import model_store
+from core import feedback, model_store
 from core.asr import MODEL_SIZES
+from ui.global_hotkey import DEFAULT_HOTKEY, GlobalHotkey, parse_hotkey
 from core.translator import CHANNELS, CHANNEL_NAMES, LANGS
 from ui import theme
 
@@ -85,6 +87,16 @@ class ControlPanel(QWidget):
         self._live_t0: Optional[float] = None   # 本轮 monotonic 起点；None = 未运行
         self._live_origin = 0.0          # 本轮时间轴起点（接着上一轮结尾）
         self._live_frozen = 0.0          # 停止瞬间的秒数，用来给最后一句收尾
+        # 标错：live = 流水线最近句快照；file = 已完成转写的句段
+        self._fb_mode = "live"
+        self._fb_count = 0
+        self._trs_session = ""
+        # 点击选中的句子（优先于「倒数第 N 句」）；block 区间用于把鼠标位置映射回句号
+        self._fb_selected: Optional[Tuple[str, int]] = None
+        self._live_blocks: List[Tuple[int, int, int]] = []
+        self._trs_blocks: List[Tuple[int, int, int]] = []
+        self._fb_syncing = False
+        self._hotkey_ok = False
         self.setWindowTitle("VTuber 实时翻译器")
         self.setWindowIcon(_icon())
         # 横版：左导航 132 + 内容区，低于这个尺寸表单会挤成两行
@@ -107,6 +119,16 @@ class ControlPanel(QWidget):
         self.sig_trs_fail.connect(self._on_trs_fail)
         self.sig_live_partial.connect(self._on_live_partial)
         self.sig_live_line.connect(self._on_live_line)
+        # 应用内快捷键作为全局热键失败时的后备（两者不会同时生效，避免一次按键记两条）
+        self._fb_shortcut = QShortcut(QKeySequence(self._hotkey_text()), self)
+        self._fb_shortcut.setContext(Qt.ApplicationShortcut)
+        self._fb_shortcut.activated.connect(self.mark_feedback)
+        # Windows 全局热键：面板在后台、焦点在游戏/播放器时也能触发。
+        # 原生事件过滤器在 GUI 线程收 WM_HOTKEY，再排队回主线程执行 mark_feedback。
+        self._hotkey = GlobalHotkey(self)
+        self._hotkey.sig_activated.connect(self.mark_feedback, Qt.QueuedConnection)
+        self._hotkey.sig_status.connect(self._on_hotkey_status)
+        self._apply_hotkey()
         self._apply_default_size()
         # 滚轮防误触：整窗统一过滤，滑过下拉框/数值框时先滚页面（见 eventFilter）
         app = QApplication.instance()
@@ -650,6 +672,8 @@ class ControlPanel(QWidget):
         self.txt_live.document().setDefaultFont(self.txt_live.font())
         self.txt_live.setPlaceholderText(
             "开始翻译后，这里按上屏顺序累积原文与译文；停止时会保留只有原文的句子。")
+        # 点击任意一句即选中，标错优先标选中句（见 _select_live_at）
+        self.txt_live.viewport().installEventFilter(self)
         v_live.addWidget(self.txt_live, 1)
         row_live = QHBoxLayout()
         self.lbl_live_out = QLabel("")
@@ -669,6 +693,61 @@ class ControlPanel(QWidget):
             b.setEnabled(False)
             row_live.addWidget(b)
         v_live.addLayout(row_live)
+
+        # 一键标错：一行操作 + 一行错误类型，数据只写 .runtime/feedback.jsonl。
+        # 找不到目标时按钮置灰，避免「按了没反应」。
+        row_fb = QHBoxLayout()
+        self.chk_fb = QCheckBox("启用标错")
+        self.chk_fb.setChecked(bool(getattr(self.cfg, "enable_feedback", True)))
+        self.chk_fb.setToolTip(
+            "开启：实时流保留最近 %d 句、转写保留全部结果，可按快捷键标记。\n"
+            "关闭：不保留快照、不写 feedback.jsonl，翻译与识别路径不受影响。" % feedback.RECENT_MAX)
+        self.chk_fb.toggled.connect(self._on_feedback_toggle)
+        self.btn_fb = QPushButton("标错")
+        self.btn_fb.setToolTip(
+            "标记选中的句子；没有选中时标记「倒数第 N 句」。\n"
+            "写 .runtime/feedback.jsonl 走后台线程，不卡字幕。")
+        self.btn_fb.clicked.connect(self.mark_feedback)
+        self.spn_fb_back = QSpinBox()
+        self.spn_fb_back.setRange(0, feedback.RECENT_MAX - 1)
+        self.spn_fb_back.setSpecialValueText("最近一句")
+        self.spn_fb_back.setPrefix("倒数第 ")
+        self.spn_fb_back.setSuffix(" 句")
+        self.spn_fb_back.setFixedWidth(120)
+        self.spn_fb_back.setToolTip(
+            "实时流可回溯最近 %d 句（约 60~80 秒）；转写完成后可回溯全部句段。" % feedback.RECENT_MAX)
+        self.spn_fb_back.valueChanged.connect(self._on_fb_back_changed)
+        lbl_hk = QLabel("热键")
+        lbl_hk.setObjectName("hint")
+        self.key_fb = QKeySequenceEdit(QKeySequence(self._hotkey_text()))
+        self.key_fb.setMaximumSequenceLength(1)
+        self.key_fb.setFixedWidth(120)
+        self.key_fb.setToolTip("Windows 全局热键：面板在后台时也能标错；至少含 Ctrl/Alt/Win")
+        self.key_fb.editingFinished.connect(self._on_hotkey_edit)
+        self.lbl_fb = QLabel("全局热键未注册")
+        self.lbl_fb.setObjectName("hint")
+        self.lbl_fb.setMaximumWidth(240)
+        row_fb.addWidget(self.chk_fb)
+        row_fb.addWidget(self.btn_fb)
+        row_fb.addWidget(self.spn_fb_back)
+        row_fb.addWidget(lbl_hk)
+        row_fb.addWidget(self.key_fb)
+        row_fb.addWidget(self.lbl_fb, 1)
+        v_live.addLayout(row_fb)
+
+        row_tags = QHBoxLayout()
+        lbl_tags = QLabel("错误类型")
+        lbl_tags.setObjectName("hint")
+        row_tags.addWidget(lbl_tags)
+        self._fb_tags = {}
+        for key, label in feedback.TAGS:
+            cb = QCheckBox(label)
+            cb.toggled.connect(self._on_fb_tag_changed)
+            self._fb_tags[key] = cb
+            row_tags.addWidget(cb)
+        row_tags.addStretch(1)
+        v_live.addLayout(row_tags)
+        self._refresh_feedback_ui()
         root.addWidget(box_live)
         self._live_update_out_label()
 
@@ -768,6 +847,7 @@ class ControlPanel(QWidget):
         self.txt_trs_result.setFont(QFont("Microsoft YaHei UI", 10))
         self.txt_trs_result.document().setDefaultFont(self.txt_trs_result.font())
         self.txt_trs_result.setPlaceholderText("转写完成后这里显示带时间戳的文本")
+        self.txt_trs_result.viewport().installEventFilter(self)
         v2.addWidget(self.txt_trs_result, 1)
         root.addWidget(box_res, 1)
         return page
@@ -1203,6 +1283,11 @@ class ControlPanel(QWidget):
         self._live_records.append((now, 0.0, src, ""))
         self._live_open[seq] = idx
         self._live_index[seq] = idx
+        if self._fb_mode != "live":
+            # 上一轮转写完成后切到了 file；新一轮实时字幕一来就切回最近句模式
+            self._set_fb_mode("live")
+        else:
+            self._refresh_feedback_ui()
         self._live_render()
 
     def _on_live_line(self, seq: int, src: str, tgt: str) -> None:
@@ -1234,9 +1319,20 @@ class ControlPanel(QWidget):
             if tgt:
                 line += "\n    " + tgt
             lines.append(line)
-        self.txt_live.setPlainText("\n".join(lines))
         sb = self.txt_live.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        saved_pos = sb.value()
+        selected = self._fb_selected
+        self.txt_live.setPlainText("\n".join(lines))
+        self._rebuild_live_blocks()
+        if (selected is not None and selected[0] == "live"
+                and self._paint_selection("live", selected[1])):
+            # 有选中句时暂停自动跟随，否则下一秒新字幕就把选中行顶走；
+            # 改倒序号或清空选择后恢复跟到底部。
+            sb.setValue(min(saved_pos, sb.maximum()))
+        else:
+            if selected is not None and selected[0] == "live":
+                self._fb_selected = None
+            sb.setValue(sb.maximum())
         has = bool(self._live_records)
         self.btn_live_clear.setEnabled(has)
         self.btn_live_txt.setEnabled(has)
@@ -1261,11 +1357,301 @@ class ControlPanel(QWidget):
         self._live_records.clear()
         self._live_open.clear()
         self._live_index.clear()
+        self._live_blocks = []
+        if self._fb_selected is not None and self._fb_selected[0] == "live":
+            self._fb_selected = None
         self.txt_live.clear()
         self.btn_live_clear.setEnabled(False)
         self.btn_live_txt.setEnabled(False)
         self.btn_live_srt.setEnabled(False)
         self.btn_live_ass.setEnabled(False)
+
+    # ------------------------------------------------------------ 一键标错
+    def _fb_pipeline(self):
+        """拿到可用的流水线；离屏冒烟/未启动时不假设存在。"""
+        pipe = getattr(self.ctrl, "pipeline", None)
+        return pipe if hasattr(pipe, "recent_sentence") else None
+
+    def _set_fb_mode(self, mode: str) -> None:
+        """live：最近 20 句；file：本次转写的全部句段（按倒数序号选）。"""
+        new_mode = "file" if mode == "file" else "live"
+        if new_mode != self._fb_mode:
+            # 换模式时旧选中句不再对应屏幕上的内容
+            self._clear_selection()
+        self._fb_mode = new_mode
+        if self._fb_mode == "file":
+            self.spn_fb_back.setRange(0, max(0, len(self._trs_segments) - 1))
+        else:
+            self.spn_fb_back.setRange(0, feedback.RECENT_MAX - 1)
+        self._refresh_feedback_ui()
+
+    # ------------------------------------------------------------ 热键
+    def _hotkey_text(self) -> str:
+        text = (getattr(self.cfg, "feedback_hotkey", "") or "").strip()
+        return text or DEFAULT_HOTKEY
+
+    def _apply_hotkey(self) -> None:
+        """按当前开关/热键注册或注销；注册失败时保留应用内快捷键兜底。"""
+        if not bool(getattr(self.cfg, "enable_feedback", True)):
+            self._hotkey.unregister()
+            self._hotkey_ok = False
+            self._fb_shortcut.setKey(QKeySequence(self._hotkey_text()))
+            self._fb_shortcut.setEnabled(True)
+            self._set_hotkey_status(False, "标错已关闭，未注册全局热键")
+            return
+        text = self._hotkey_text()
+        self._fb_shortcut.setKey(QKeySequence(text))
+        ok, _msg = self._hotkey.register(text)
+        self._hotkey_ok = ok
+        # 全局注册成功就关掉应用内快捷键，否则一次按键会记两条
+        self._fb_shortcut.setEnabled(not ok)
+
+    def _on_hotkey_status(self, ok: bool, msg: str) -> None:
+        self._set_hotkey_status(ok, msg)
+        if not ok and bool(getattr(self.cfg, "enable_feedback", True)):
+            self._log("标错热键：" + msg)
+
+    def _set_hotkey_status(self, ok: bool, msg: str) -> None:
+        self.lbl_fb.setText(msg)
+        self.lbl_fb.setToolTip(msg)
+        red = (not ok) and bool(getattr(self.cfg, "enable_feedback", True))
+        self.lbl_fb.setStyleSheet("color:#d9534f" if red else "")
+
+    def _on_hotkey_edit(self) -> None:
+        text = self.key_fb.keySequence().toString(QKeySequence.PortableText)
+        if not text:
+            self.key_fb.setKey(QKeySequence(self._hotkey_text()))
+            return
+        try:
+            parse_hotkey(text)
+        except ValueError as exc:
+            # 格式无效就回退到上一个键，别把可用热键注销掉
+            self._set_hotkey_status(False, "%s；仍用 %s" % (exc, self._hotkey_text()))
+            self.key_fb.setKey(QKeySequence(self._hotkey_text()))
+            return
+        if text != self._hotkey_text():
+            self.cfg.feedback_hotkey = text
+            try:
+                self.cfg.save()
+            except Exception:
+                pass
+            self._log("标错热键改为：%s" % text)
+        self._apply_hotkey()
+
+    def shutdown_hotkey(self) -> None:
+        """退出路径统一注销，可重复调用。"""
+        try:
+            self._hotkey.shutdown()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ 选中句
+    @staticmethod
+    def _block_ranges(two_line_flags: List[bool]) -> List[Tuple[int, int, int]]:
+        """把「每句 1~2 行」的纯文本映射成 (起始块, 结束块, 记录下标)。"""
+        ranges = []
+        block = 0
+        for i, two in enumerate(two_line_flags):
+            end = block + (1 if two else 0)
+            ranges.append((block, end, i))
+            block = end + 1
+        return ranges
+
+    def _rebuild_live_blocks(self) -> None:
+        self._live_blocks = self._block_ranges([bool(tgt) for _a, _b, _s, tgt in self._live_records])
+
+    def _rebuild_trs_blocks(self, shown_count: int) -> None:
+        flags = [bool(getattr(self._trs_segments[i], "tgt", "")) for i in range(shown_count)]
+        self._trs_blocks = self._block_ranges(flags)
+
+    def _paint_selection(self, mode: str, idx: int, ensure: bool = False) -> bool:
+        widget = self.txt_live if mode == "live" else self.txt_trs_result
+        ranges = self._live_blocks if mode == "live" else self._trs_blocks
+        match = next((r for r in ranges if r[2] == idx), None)
+        if match is None:
+            return False
+        doc = widget.document()
+        first = doc.findBlockByNumber(match[0])
+        last = doc.findBlockByNumber(match[1])
+        if not first.isValid() or not last.isValid():
+            return False
+        cur = QTextCursor(first)
+        cur.setPosition(last.position() + len(last.text()))
+        widget.setTextCursor(cur)
+        if ensure:
+            widget.ensureCursorVisible()
+        return True
+
+    def _select_at(self, widget, pos) -> None:
+        if widget is self.txt_live.viewport():
+            mode, ranges, view = "live", self._live_blocks, self.txt_live
+        elif widget is self.txt_trs_result.viewport():
+            mode, ranges, view = "file", self._trs_blocks, self.txt_trs_result
+        else:
+            return
+        block = view.cursorForPosition(pos).blockNumber()
+        for b0, b1, idx in ranges:
+            if b0 <= block <= b1:
+                self._fb_selected = (mode, idx)
+                self._paint_selection(mode, idx, ensure=True)
+                if mode == "file":
+                    # 同步倒序号，方便用户看到「这是第几句」
+                    self._fb_syncing = True
+                    try:
+                        self.spn_fb_back.setValue(len(self._trs_segments) - 1 - idx)
+                    finally:
+                        self._fb_syncing = False
+                self._refresh_feedback_ui()
+                self._log("已选中 %s，点「标错」或按热键记录" % self._fb_where(mode, idx))
+                return
+
+    def _fb_where(self, mode: str, idx: int) -> str:
+        if mode == "file":
+            return "转写第 %d/%d 句" % (idx + 1, len(self._trs_segments))
+        return "倒数第 %d 句" % (len(self._live_records) - idx)
+
+    def _clear_selection(self) -> None:
+        if self._fb_selected is None:
+            return
+        self._fb_selected = None
+        for w in (self.txt_live, self.txt_trs_result):
+            cur = w.textCursor()
+            cur.clearSelection()
+            w.setTextCursor(cur)
+
+    def _live_seq_for(self, idx: int):
+        for seq, i in self._live_index.items():
+            if i == idx:
+                return seq
+        return None
+
+    def _channel_for_seq(self, seq) -> str:
+        pipe = self._fb_pipeline()
+        if pipe is None or seq is None:
+            return ""
+        for k in range(feedback.RECENT_MAX):
+            snap = pipe.recent_sentence(k)
+            if snap is None:
+                break
+            if snap.get("seq") == seq:
+                return snap.get("channel", "")
+        return ""
+
+    def _fb_target(self):
+        """选中句优先；否则回落到「倒数第 N 句」。"""
+        if self._fb_selected is not None:
+            mode, idx = self._fb_selected
+            if mode == "live" and 0 <= idx < len(self._live_records):
+                return ("live_sel", idx)
+            if mode == "file" and 0 <= idx < len(self._trs_segments):
+                return ("file", idx)
+            self._fb_selected = None
+        back = int(self.spn_fb_back.value())
+        if self._fb_mode == "file" and self._trs_segments:
+            idx = len(self._trs_segments) - 1 - back
+            return ("file", idx) if 0 <= idx < len(self._trs_segments) else None
+        pipe = self._fb_pipeline()
+        if pipe is not None and pipe.recent_sentence(back) is not None:
+            return ("live", back)
+        return None
+
+    def _refresh_feedback_ui(self) -> None:
+        on = bool(getattr(self.cfg, "enable_feedback", True))
+        for cb in self._fb_tags.values():
+            cb.setEnabled(on)
+        self.chk_fb.setChecked(on)
+        self.spn_fb_back.setEnabled(on)
+        self.key_fb.setEnabled(on)
+        self.btn_fb.setEnabled(on and self._fb_target() is not None)
+
+    def _on_feedback_toggle(self, checked: bool) -> None:
+        self.cfg.enable_feedback = bool(checked)
+        try:
+            self.cfg.save()
+        except Exception:
+            pass
+        self._apply_hotkey()
+        self._refresh_feedback_ui()
+
+    def _on_fb_back_changed(self, _v: int) -> None:
+        if self._fb_syncing:
+            return
+        # 用户主动改倒序号 = 放弃选中句，回到「最近 N 句」方式
+        self._clear_selection()
+        self._refresh_feedback_ui()
+
+    def _on_fb_tag_changed(self, _checked: bool) -> None:
+        # 类型只是写进记录的标签，不需要动配置，也不需要刷新可用状态
+        pass
+
+    def mark_feedback(self) -> None:
+        """把当前目标句 + 勾选的错误类型写进 jsonl（后台线程，按键路径无 IO）。"""
+        if not bool(getattr(self.cfg, "enable_feedback", True)):
+            self._log("标错已关闭：先勾选「启用标错」")
+            return
+        tags = [k for k, cb in self._fb_tags.items() if cb.isChecked()]
+        if not tags:
+            # 快路径：来不及选类型时也要能记下来，归入「其他」
+            tags = ["other"]
+        target = self._fb_target()
+        if target is None:
+            self._log("没有可标记的句子：先开始翻译，或先完成一次转写")
+            self._refresh_feedback_ui()
+            return
+        if target[0] == "file":
+            idx = target[1]
+            seg = self._trs_segments[idx]
+            session = self._trs_session or feedback.new_session_id("file")
+            tgt_text = getattr(seg, "tgt", "")
+            entry = feedback.make_entry(
+                cfg=self.cfg, session_id=session, source="file", seq=idx,
+                back=len(self._trs_segments) - 1 - idx, src=seg.text,
+                tgt=tgt_text, channel=getattr(seg, "channel", ""),
+                tags=tags, start_s=seg.start, end_s=seg.end,
+                has_audio=bool(self._trs_path), media=self._trs_path,
+                pipeline=self._fb_pipeline())
+            where = "转写第 %d/%d 句" % (idx + 1, len(self._trs_segments))
+        elif target[0] == "live_sel":
+            # 点击选中的实时句：原文/译文取面板记录，通道按 seq 回查流水线快照
+            idx = target[1]
+            a, b, src, tgt = self._live_records[idx]
+            pipe = self._fb_pipeline()
+            seq = self._live_seq_for(idx)
+            entry = feedback.make_entry(
+                cfg=self.cfg, session_id=getattr(pipe, "session_id", "") or "live-unknown",
+                source="live", seq=seq if seq is not None else -1,
+                back=len(self._live_records) - 1 - idx, src=src, tgt=tgt,
+                channel=self._channel_for_seq(seq), tags=tags,
+                start_s=a, end_s=b, has_audio=False, media="", pipeline=pipe)
+            where = "选中第 %d 句" % (idx + 1)
+        else:
+            pipe = self._fb_pipeline()
+            snap = pipe.recent_sentence(int(self.spn_fb_back.value()))
+            if snap is None:
+                # 极端情况：刚检查完目标就被新句子挤出窗口
+                self._log("这句已经滚出最近 %d 句窗口，未记录" % feedback.RECENT_MAX)
+                return
+            session = getattr(pipe, "session_id", "") or feedback.new_session_id("live")
+            entry = feedback.make_entry(
+                cfg=self.cfg, session_id=session, source="live", seq=snap["seq"],
+                back=int(self.spn_fb_back.value()), src=snap.get("src", ""),
+                tgt=snap.get("tgt", ""), channel=snap.get("channel", ""),
+                tags=tags, start_s=snap.get("ts_src"), end_s=snap.get("ts_tgt"),
+                has_audio=False, media="", pipeline=pipe)
+            where = "倒数第 %d 句" % (int(self.spn_fb_back.value()) + 1)
+        store = getattr(self.ctrl, "feedback", None)
+        if store is None or not hasattr(store, "submit"):
+            self._log("标错写手未初始化，本条未记录")
+            return
+        ok = bool(store.submit(entry))
+        if ok:
+            self._fb_count += 1
+            names = "/".join(feedback.TAG_NAMES.get(t, t) for t in entry["tags"])
+            self._log("已标错 #%d：%s · %s" % (self._fb_count, where, names))
+            self.btn_fb.setText("已记录")
+            QTimer.singleShot(900, lambda: self.btn_fb.setText("标错"))
+        else:
+            self._log("标错写入队列失败（队列满或序列化异常），本条未记录")
 
     def _export_live(self, kind: str) -> None:
         """导出实时记录：复用 core/transcribe 的 TXT / SRT / ASS 格式。
@@ -1316,6 +1702,8 @@ class ControlPanel(QWidget):
         self._trs_path = path
         self._trs_segments = []
         self._trs_total = 0.0
+        self._trs_session = ""
+        self._set_fb_mode("live")
         self.lbl_trs_file.setText(os.path.basename(path))
         self.lbl_trs_file.setToolTip(path)
         self.lbl_trs_out.setText(f"导出目录：{os.path.dirname(path)}")
@@ -1343,7 +1731,11 @@ class ControlPanel(QWidget):
             return
         self.txt_trs_result.clear()
         self._trs_segments = []
+        self._trs_blocks = []
         self._trs_total = 0.0
+        # 每次转写换新会话 id，标错记录才能和这一份文件对应起来
+        self._trs_session = feedback.new_session_id("file")
+        self._fb_count = 0
         for b in self._trs_export_btns:
             b.setEnabled(False)
         self.bar_trs.setValue(0)
@@ -1369,6 +1761,10 @@ class ControlPanel(QWidget):
         segments, total, cancelled = payload
         self._trs_segments = list(segments)
         self._trs_total = float(total or 0.0)
+        if self._fb_selected is not None and self._fb_selected[0] == "file":
+            self._fb_selected = None
+        # 转写完成后标错目标切到这份结果；没有句段就退回实时快照
+        self._set_fb_mode("file" if self._trs_segments else "live")
         self.set_transcribing(False)
         if not segments:
             self.lbl_trs_state.setText(
@@ -1390,6 +1786,8 @@ class ControlPanel(QWidget):
         if len(lines) > len(shown):
             text += f"\n…（共 {len(lines)} 句，预览只显示前 {len(shown)} 句，导出为完整内容）"
         self.txt_trs_result.setPlainText(text)
+        # 预览与导出同源，但点击标记只覆盖预览里真实显示出来的句子
+        self._rebuild_trs_blocks(len(shown))
         for b in self._trs_export_btns:
             b.setEnabled(True)
         # 没开翻译时这两个按钮导不出东西，直接置灰
@@ -1481,6 +1879,8 @@ class ControlPanel(QWidget):
         if running:
             if self._live_t0 is None:
                 self._live_t0 = time.monotonic()
+            if self._fb_mode != "live":
+                self._set_fb_mode("live")
         elif self._live_t0 is not None:
             # 停止：末句结束时间取停止时刻；只有原文、没有译文的句子原样留在记录里
             self._live_frozen = self._live_origin + (time.monotonic() - self._live_t0)
@@ -1489,6 +1889,7 @@ class ControlPanel(QWidget):
             self._live_open.clear()
             self._live_origin = self._live_frozen
             self._live_render()
+        self._refresh_feedback_ui()
         self.btn_start.setText("停止翻译" if running else "开始翻译")
         # 动态属性 + 重新 polish：让 QSS 里 [running="true"] 那套配色生效
         self.btn_start.setProperty("running", "true" if running else "false")
@@ -1565,6 +1966,11 @@ class ControlPanel(QWidget):
         - 没焦点 → 把滚轮事件转给滚动区 viewport，页面按原生手感滚动，值不变。
         只拦 Wheel：键盘上下键、拖动滑块走 keyPress/mouseMove，不受影响。
         """
+        if (ev.type() == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton
+                and obj in (self.txt_live.viewport(), self.txt_trs_result.viewport())):
+            # 点击整句选中（而不是把光标落在一个字上），标错时按句取
+            self._select_at(obj, ev.position().toPoint())
+            return True
         if ev.type() == QEvent.Wheel and hasattr(self, "scroll"):
             w = obj
             # 数值框内部可能是 QLineEdit，往上找一两层认领控件
@@ -1587,5 +1993,7 @@ class ControlPanel(QWidget):
         if self._glossary_timer.isActive():
             self._glossary_timer.stop()
             self._on_glossary()
+        # 先注销系统级热键，避免进程退出后热键仍被占用
+        self.shutdown_hotkey()
         event.accept()
         self.ctrl.quit()

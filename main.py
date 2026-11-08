@@ -103,6 +103,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from core import feedback
 from core.audio import list_capture_devices, pick_default_device
 from core.config import AppConfig
 from core.pipeline import Pipeline
@@ -118,6 +119,8 @@ class AppController:
         self._trs_busy = False          # 音频转文字进行中：与实时字幕互斥
         self._trs_cancel = threading.Event()
         self.cfg = AppConfig.load()
+        # 标错写手随程序启动：后台线程只做追加写，面板按键只是入队
+        self.feedback = feedback.FeedbackWriter()
         self.pipeline = Pipeline(self.cfg)
         self.overlay = SubtitleOverlay(self.cfg)
         self.panel = ControlPanel(self.cfg, self)
@@ -467,6 +470,16 @@ class AppController:
         except Exception:
             pass
         self.pipeline.stop()
+        # 退出前把标错队列写完（含 fsync），别让最后几次标记停在内存里
+        try:
+            self.feedback.close()
+        except Exception:
+            pass
+        # 全局热键是系统级资源，退出必须显式注销（closeEvent 之外再兜一层）
+        try:
+            getattr(self, "panel", None).shutdown_hotkey()
+        except Exception:
+            pass
         # 主动释放单实例名：别等进程彻底结束才放手，
         # 否则收尾期间再双击会误判「已经在运行」
         if _SERVER is not None:
