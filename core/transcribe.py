@@ -37,6 +37,8 @@ class Cue:
     words: List[Dict[str, float]] = field(default_factory=list)
     # 译文：离线翻译后回填，与 text 一一对应（可能为空）
     tgt: str = ""
+    # 该句译文实际用的通道（供标错记录用，不参与导出）
+    channel: str = ""
 
 
 def _span(seg) -> Tuple[float, float, str]:
@@ -340,6 +342,8 @@ def translate_segments(translator, segments: List[Segment], roster: str = "",
         if out:
             if isinstance(seg, Cue):
                 seg.tgt = out
+                # 只有真正拿到译文才记通道：失败时 last_channel() 可能是别的句子的
+                seg.channel = translator.last_channel()
             done += 1
         if on_progress is not None:
             on_progress(i, total)

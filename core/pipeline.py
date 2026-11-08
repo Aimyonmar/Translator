@@ -20,6 +20,7 @@ from .context import ContextBuffer, fix_homophones, fix_translation
 from .translator import Translator
 from .vad import SpeechSegmenter
 from .denoise import Denoise
+from . import feedback
 from . import timing
 
 
@@ -68,6 +69,11 @@ class Pipeline:
         # 语境窗口：最近几句上屏内容，供同音词纠正与翻译上下文使用。
         # 容量固定 8（配置上限），每次按 cfg.context_window 取用。
         self.context = ContextBuffer(maxlen=8)
+        # 标错用最近句快照：只存内存、只在上屏/译文回来时各更新一次，
+        # 关闭 enable_feedback 后一次都不写（见 core/feedback.py）。
+        self.recent = feedback.RecentSentences(feedback.RECENT_MAX)
+        self.session_id = ""
+        self._session_t0 = time.time()
 
     # ------------------------------------------------------------ 控制
     def start(self) -> None:
@@ -89,6 +95,10 @@ class Pipeline:
             self._next_seq = 0
         # 新一场直播：上一场的句子不能当这一场的语境
         self.context.clear()
+        # 标错会话：每次开始换新 id，旧句子不再出现在可标记窗口里
+        self.session_id = feedback.new_session_id("live")
+        self._session_t0 = time.time()
+        self.recent.clear()
         self.state = "loading"
         self.on_status("正在准备模型…")
         threading.Thread(target=self._boot, args=(stop_evt,), daemon=True).start()
@@ -231,6 +241,18 @@ class Pipeline:
                     return
             self.state = "running"
             self.on_status("正在聆听…（系统声音）")
+
+    # ------------------------------------------------------------ 标错
+    def recent_sentence(self, back: int = 0) -> Optional[dict]:
+        """最近一句（back=0）或倒数第 back+1 句的快照；没有则 None。"""
+        try:
+            return self.recent.get(back)
+        except Exception:
+            return None
+
+    def session_start_wall(self) -> float:
+        """本轮开始时的墙钟时间，用来把快照里的相对秒换成时间戳。"""
+        return self._session_t0
 
     def restart_audio(self) -> None:
         """切换设备后重新采集，不影响已加载的模型。"""
@@ -569,6 +591,11 @@ class Pipeline:
             self.on_partial(seq, text)
         except Exception:
             pass
+        if getattr(self.cfg, "enable_feedback", True):
+            try:
+                self.recent.add_text(seq, text, time.time() - self._session_t0)
+            except Exception:
+                pass
         try:
             meta["partial_ts"] = time.perf_counter()
         except Exception:
@@ -677,6 +704,9 @@ class Pipeline:
             finally:
                 t_tr_end = time.perf_counter()
             meta["req"] = getattr(self.translator, "req_count", 0) - req0
+            # 通道在 translate 返回后立刻取：last_channel() 是线程内的，
+            # 两个翻译线程并发时，只有这里取才是这一句自己的通道
+            meta["channel"] = self.translator.last_channel()
             if stop_evt.is_set():      # 停止后别再往新一轮的状态里写旧序号
                 break
             with self._seq_lock:
@@ -742,6 +772,13 @@ class Pipeline:
                 self.on_result(seq, disp_text, out)
             except Exception:
                 pass
+            if getattr(self.cfg, "enable_feedback", True):
+                try:
+                    self.recent.set_result(seq, disp_text, out or "",
+                                           meta.get("channel", ""),
+                                           time.time() - self._session_t0)
+                except Exception:
+                    pass
             # 只在真正上屏后入窗：并行翻译回包是乱序的，按上屏顺序记才不会错位
             try:
                 self.context.push(disp_text, out)

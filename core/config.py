@@ -125,6 +125,12 @@ class AppConfig:
     trs_max_chars: int = 0
     # 实时记录导出目录：留空时导出到「文档」，成功后自动记住
     export_dir: str = ""
+    # 一键标错：默认开。只在用户按快捷键/按钮时写一行 jsonl（后台线程），
+    # 不碰识别与翻译路径；关闭后 pipeline 不再保留最近句快照，开销为 0。
+    enable_feedback: bool = True
+    # 标错热键：Windows 全局注册（面板在后台/游戏前台也能触发）。
+    # Ctrl+Alt+M 比 Ctrl+Shift+M 更少和常见软件冲突；至少含 Ctrl/Alt/Win。
+    feedback_hotkey: str = "Ctrl+Alt+M"
     # 音频预处理：轻量谱减法降噪，压低稳态背景噪声（风扇/电流声/低频隆隆）。
     # 对 BGM 这类非稳态音乐帮助有限（那需要人声分离模型），但能改善整体信噪比。
     enable_denoise: bool = True
@@ -205,7 +211,7 @@ class AppConfig:
         "custom_type", "custom_key", "custom_base", "custom_model", "caiyun_token",
         "last_channel", "word_map", "name_roster", "proxy", "context_glossary",
         "transcribe_dir", "export_dir", "translate_glossary",
-        "llm_provider", "llm_key", "llm_model", "zh_rules",
+        "llm_provider", "llm_key", "llm_model", "zh_rules", "feedback_hotkey",
     )
 
     def _sanitize(self) -> None:
