@@ -122,7 +122,8 @@ class AppConfig:
     enable_zh_polish: bool = True
     # 规则化译后处理（core/zh_rules.py）：终助词语气、惯用句、数词单位、授受方向、
     # 省略主语、口语缩略。默认开启；命中计数见 zh_rules.take_stats()。
-    # 误改回收：把对应规则名从 zh_rules 里删掉（或加 - 前缀）即可单独关闭。
+    # 误改回收：把对应规则名或 id 从 zh_rules 里删掉（或加 - 前缀）即可单独关闭，
+    # 例如 zh_rules = "-zh-tone" 只关语气规则，其余五条照常。
     enable_zh_rules: bool = True
     zh_rules: str = "tone,idiom,number,direction,subject,contraction"
     # 英文句路由：主播真说英文（拉丁字母占多数）时自动改走 EN→ZH。可设 False 关闭。

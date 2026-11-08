@@ -24,7 +24,8 @@ from .phrases import is_colloquial, lookup as phrase_lookup
 from .loanwords import apply_loanwords
 from .ja_norm import prepare as ja_prepare
 from .zh_polish import zh_polish
-from .zh_rules import apply_rules as apply_zh_rules, restore_contractions
+from .zh_rules import (apply_rules as apply_zh_rules, format_hits as format_rule_hits,
+                       restore_contractions)
 
 CHANNELS = ["auto", "custom", "tencent", "caiyun", "mymemory", "edge", "google", "deepl"]
 CHANNEL_NAMES = {"auto": "自动", "custom": "自定义 API", "tencent": "腾讯翻译君",
@@ -510,7 +511,9 @@ class Translator:
                     text, out, getattr(self.cfg, "zh_rules", "") or "")
                 if r_notes:
                     self.last_rule_hits = r_notes
-                    self._say(f"规则[{','.join(r_notes)}] {before_rules} → {out}")
+                    # 日志带规则 id：一条错改能直接定位到「关掉哪个 id」
+                    self._say("规则[%s] %s → %s"
+                              % (",".join(format_rule_hits(r_notes)), before_rules, out))
             # 术语表译文兜底：只回改诊断里实测过的坏译法（蒙汉世界→怪物猎人：世界），
             # 命中才动；用户词表不参与译后替换，避免把正常中文改回日文。
             if getattr(self.cfg, "enable_translate_glossary", False):

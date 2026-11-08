@@ -981,8 +981,9 @@ class ControlPanel(QWidget):
         # 规则改写追溯：默认全开后，命中会进日志条，这里可回看最近 20 条对照
         box_rule = QGroupBox("规则化译后处理（默认开启）")
         f = QFormLayout(box_rule)
-        lbl_rule = QLabel("译后规则命中时会以「规则[名] 改前 → 改后」写进底部日志；"
-                          "最近 20 条同时保存在 .runtime/rule_changes.json，重启后仍可查。")
+        lbl_rule = QLabel("译后规则命中时会以「规则[id/v版本] 改前 → 改后」写进底部日志；"
+                          "最近 20 条同时保存在 .runtime/rule_changes.json，重启后仍可查。"
+                          "配置里可用 id 只开或排除单条，如 zh_rules=-zh-tone。")
         lbl_rule.setObjectName("hint")
         lbl_rule.setWordWrap(True)
         self.btn_rule_trace = QPushButton("查看最近 20 条")
@@ -1011,7 +1012,10 @@ class ControlPanel(QWidget):
             return
         lines = []
         for i, r in enumerate(rows, 1):
-            lines.append(f"{i}. [{r.get('rule', '')}] {r.get('before', '')} → {r.get('after', '')}")
+            rid = r.get("rule_id") or r.get("rule", "")
+            ver = r.get("rule_ver")
+            tag = "%s/v%s" % (rid, ver) if ver else rid
+            lines.append(f"{i}. [{tag}] {r.get('rule', '')}：{r.get('before', '')} → {r.get('after', '')}")
             lines.append(f"   原文：{r.get('src', '')}")
         dlg = QDialog(self)
         dlg.setWindowTitle("最近 20 条规则改写")

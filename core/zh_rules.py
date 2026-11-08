@@ -27,11 +27,47 @@ import time
 from collections import Counter, deque
 from typing import Deque, List, Tuple
 
-__all__ = ["RULES", "parse_rules", "restore_contractions", "apply_rules",
-           "take_stats", "recent", "EXAMPLES", "TRACE_PATH"]
+__all__ = ["RULES", "RULE_META", "parse_rules", "restore_contractions", "apply_rules",
+           "take_stats", "recent", "EXAMPLES", "TRACE_PATH", "format_hits"]
 
 RULES = ("tone", "idiom", "number", "direction", "subject", "contraction")
 DEFAULT_RULES = ",".join(RULES)
+
+# 每条规则的元数据：id 用于「只开/排除某几条」与命中记录对账；ver 在规则逻辑变化时递增；
+# source 写的是 37 句诊断语料里能复现的具体错法，不复述规则本身。
+RULE_META = {
+    "tone": {
+        "id": "zh-tone", "ver": 1,
+        "source": "37 句语料：よ/ね/よね/じゃん 语气丢失；んだけど 被译成「虽然…的，」",
+    },
+    "idiom": {
+        "id": "zh-idiom", "ver": 1,
+        "source": "37 句语料：来てくれてありがとう 被直译成「谢谢你给我的人」",
+    },
+    "number": {
+        "id": "zh-number", "ver": 1,
+        "source": "37 句语料：円→圆、時間→时间、回→回的错单位（1000 円/3 時間/2 回）",
+    },
+    "direction": {
+        "id": "zh-direction", "ver": 1,
+        "source": "37 句语料：てあげる 被翻成「给我」、てくれる/てもらう 被翻成「给你」",
+    },
+    "subject": {
+        "id": "zh-subject", "ver": 1,
+        "source": "37 句语料：怖い/寂しい/嬉しい 等情绪句省略主语，译文无人称",
+    },
+    "contraction": {
+        "id": "zh-contraction", "ver": 1,
+        "source": "37 句语料：っつー/すんの/じゃねぇ 等口语缩略送翻前未展开导致误译",
+    },
+}
+
+# 名字与 id 都能写进配置：`zh_rules = "zh-tone,-zh-number"` 与
+# `"tone,-number"` 等价；混用也按同一集合处理。
+_ALIAS = {}
+for _name in RULES:
+    _ALIAS[_name] = _name
+    _ALIAS[RULE_META[_name]["id"]] = _name
 
 # 最近 20 条改写落盘位置：进程重启后仍能在面板/文件里回溯「规则改了什么」
 TRACE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -54,15 +90,15 @@ EXAMPLES: Deque[Tuple[str, str, str, str]] = deque(maxlen=20)
 
 
 def parse_rules(raw: str) -> set:
-    """解析 `"tone,idiom,-number"`；未知项忽略，`-x` 表示从全集中去掉。
+    """解析 `"tone,idiom,-number"`；名字与 id 等价（`"zh-tone,-zh-number"` 同义）。
 
-    空串 = 一条都不开（安全默认）；只有调用方显式传 DEFAULT_RULES 才全开。
+    未知项忽略，`-x` 表示从全集中去掉；空串 = 一条都不开（安全默认）。
     """
     if raw is None or not str(raw).strip():
         return set()
     items = [s.strip().lower() for s in str(raw).replace("，", ",").split(",") if s.strip()]
-    plus = {s for s in items if not s.startswith("-")}
-    minus = {s[1:] for s in items if s.startswith("-")}
+    plus = {_ALIAS.get(s, s) for s in items if not s.startswith("-")}
+    minus = {_ALIAS.get(s[1:], s[1:]) for s in items if s.startswith("-")}
     if not plus:
         plus = set(RULES)
     return (plus & set(RULES)) - minus
@@ -71,6 +107,23 @@ def parse_rules(raw: str) -> set:
 def _hit(rule: str) -> None:
     with _STAT_LOCK:
         _STATS[rule] += 1
+
+
+def format_hits(names) -> List[str]:
+    """规则名 → 日志用的「id/v版本」，如 `zh-tone/v1`；未知项原样返回。"""
+    out = []
+    for n in names:
+        m = RULE_META.get(n)
+        out.append("%s/v%d" % (m["id"], m["ver"]) if m else str(n))
+    return out
+
+
+def _row(src: str, before: str, after: str, rule: str) -> dict:
+    """一条命中记录：保留规则名，同时带上 id / 版本 / 依据，便于按 id 关规则。"""
+    m = RULE_META.get(rule, {})
+    return {"src": src, "before": before, "after": after, "rule": rule,
+            "rule_id": m.get("id", rule), "rule_ver": m.get("ver", 0),
+            "rule_source": m.get("source", "")}
 
 
 def _record(src: str, before: str, after: str, rule: str) -> None:
@@ -107,8 +160,7 @@ def _trace_loop() -> None:
 def _persist() -> None:
     """把 EXAMPLES 落到 .runtime/rule_changes.json，重启后仍可回溯。"""
     with _STAT_LOCK:
-        rows = [{"src": s, "before": b, "after": a, "rule": r}
-                for s, b, a, r in EXAMPLES]
+        rows = [_row(s, b, a, r) for s, b, a, r in EXAMPLES]
     try:
         os.makedirs(os.path.dirname(TRACE_PATH), exist_ok=True)
         tmp = TRACE_PATH + ".tmp"
@@ -123,8 +175,7 @@ def recent(limit: int = 20) -> List[dict]:
     """最近 limit 条改写（原句 / 改前 / 改后 / 规则），新的在后。"""
     with _STAT_LOCK:
         rows = list(EXAMPLES)
-    return [{"src": s, "before": b, "after": a, "rule": r}
-            for s, b, a, r in rows[-max(1, int(limit)):]]
+    return [_row(s, b, a, r) for s, b, a, r in rows[-max(1, int(limit)):]]
 
 
 def take_stats() -> dict:
