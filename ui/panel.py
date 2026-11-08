@@ -2,6 +2,7 @@
 """控制面板：设备 / 模型 / 翻译 / 字幕 参数调节与运行状态。"""
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QComboBox, QPushButton, QSlider, QSpinBox, QDoubleSpinBox, QCheckBox,
     QPlainTextEdit, QProgressBar, QMessageBox, QLineEdit, QScrollArea, QFrame,
     QApplication, QAbstractSpinBox, QButtonGroup, QStackedWidget, QFileDialog,
+    QDialog,
 )
 
 from core import model_store
@@ -858,8 +860,54 @@ class ControlPanel(QWidget):
         tip.setObjectName("hint")
         tip.setWordWrap(True)
         root.addWidget(tip)
+
+        # 规则改写追溯：默认全开后，命中会进日志条，这里可回看最近 20 条对照
+        box_rule = QGroupBox("规则化译后处理（默认开启）")
+        f = QFormLayout(box_rule)
+        lbl_rule = QLabel("译后规则命中时会以「规则[名] 改前 → 改后」写进底部日志；"
+                          "最近 20 条同时保存在 .runtime/rule_changes.json，重启后仍可查。")
+        lbl_rule.setObjectName("hint")
+        lbl_rule.setWordWrap(True)
+        self.btn_rule_trace = QPushButton("查看最近 20 条")
+        self.btn_rule_trace.clicked.connect(self._show_rule_trace)
+        row_rule = QHBoxLayout()
+        row_rule.addWidget(lbl_rule, 1)
+        row_rule.addWidget(self.btn_rule_trace)
+        f.addRow("", row_rule)
+        root.addWidget(box_rule)
+
         root.addStretch(1)
         return page
+
+    def _show_rule_trace(self) -> None:
+        """展示最近 20 条规则改写：内存优先，重启后回落到落盘记录。"""
+        from core import zh_rules
+        rows = zh_rules.recent(20)
+        if not rows:
+            try:
+                with open(zh_rules.TRACE_PATH, "r", encoding="utf-8") as f:
+                    rows = (json.load(f) or [])[-20:]
+            except Exception:
+                rows = []
+        if not rows:
+            QMessageBox.information(self, "规则改写记录", "还没有命中记录。")
+            return
+        lines = []
+        for i, r in enumerate(rows, 1):
+            lines.append(f"{i}. [{r.get('rule', '')}] {r.get('before', '')} → {r.get('after', '')}")
+            lines.append(f"   原文：{r.get('src', '')}")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("最近 20 条规则改写")
+        dlg.resize(640, 460)
+        v = QVBoxLayout(dlg)
+        view = QPlainTextEdit("\n".join(lines))
+        view.setReadOnly(True)
+        view.setFont(QFont("Microsoft YaHei UI", 10))
+        v.addWidget(view, 1)
+        btn = QPushButton("关闭")
+        btn.clicked.connect(dlg.accept)
+        v.addWidget(btn, 0, Qt.AlignRight)
+        dlg.exec()
 
     def _apply_default_size(self) -> None:
         """默认横版尺寸：按分页布局取一个固定比例，再夹到屏幕可用区域内。

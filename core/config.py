@@ -103,6 +103,11 @@ class AppConfig:
     # 译文口语化润色（core/zh_polish.py，确定性规则、0ms）：修免费通道的固定生硬模式
     # （伙计们→大家、您→你、想尝试→想试试、半角标点全角化、去句尾书面句号）。
     enable_zh_polish: bool = True
+    # 规则化译后处理（core/zh_rules.py）：终助词语气、惯用句、数词单位、授受方向、
+    # 省略主语、口语缩略。默认开启；命中计数见 zh_rules.take_stats()。
+    # 误改回收：把对应规则名从 zh_rules 里删掉（或加 - 前缀）即可单独关闭。
+    enable_zh_rules: bool = True
+    zh_rules: str = "tone,idiom,number,direction,subject,contraction"
     # 英文句路由：主播真说英文（拉丁字母占多数）时自动改走 EN→ZH。可设 False 关闭。
     enable_en_route: bool = True
     # 主备式延迟补发（core/translator.py）：主通道超过 hedge_backup_ms 还没返回，
@@ -200,7 +205,7 @@ class AppConfig:
         "custom_type", "custom_key", "custom_base", "custom_model", "caiyun_token",
         "last_channel", "word_map", "name_roster", "proxy", "context_glossary",
         "transcribe_dir", "export_dir", "translate_glossary",
-        "llm_provider", "llm_key", "llm_model",
+        "llm_provider", "llm_key", "llm_model", "zh_rules",
     )
 
     def _sanitize(self) -> None:

@@ -24,6 +24,7 @@ from .phrases import is_colloquial, lookup as phrase_lookup
 from .loanwords import apply_loanwords
 from .ja_norm import prepare as ja_prepare
 from .zh_polish import zh_polish
+from .zh_rules import apply_rules as apply_zh_rules, restore_contractions
 
 CHANNELS = ["auto", "custom", "tencent", "caiyun", "mymemory", "edge", "google", "deepl"]
 CHANNEL_NAMES = {"auto": "自动", "custom": "自定义 API", "tencent": "腾讯翻译君",
@@ -92,6 +93,8 @@ class Translator:
         self.req_count = 0
         self.fail_count = 0
         self.route_log: list = []
+        # 最近一条字幕命中的译后规则（供诊断/面板展示，不影响翻译）
+        self.last_rule_hits: list = []
         self._route_lock = threading.Lock()
         self._gid = 0
         self.proxy: str = getattr(cfg, "proxy", "") or ""
@@ -396,7 +399,11 @@ class Translator:
             #    折叠 ASR 重复子句（「相当してください、相当ください」→ 只留一句）；
             # 2) loanwords：片假名外来语换成人工校准的中文义（アプデ=更新…）。
             # 两者都对着「上屏的原文」做，缓存 key 仍用原始 text，译文不串味。
-            pro = ja_prepare(text)
+            pro = text
+            if getattr(self.cfg, "enable_zh_rules", False):
+                # 缩略还原属于送翻前处理：只展开歧义小的口语形（っつー/すんの…）
+                pro, _c_notes = restore_contractions(pro)
+            pro = ja_prepare(pro)
             if getattr(self.cfg, "enable_loanwords", True):
                 pro = apply_loanwords(pro)
             # 翻译侧术语表：把专名换成人定的中文名再送翻（整词精确匹配）。
@@ -495,6 +502,15 @@ class Translator:
             # 规则只动词级与标点，绝不动句法——润色失败顶多不自然，不引入新错误。
             if getattr(self.cfg, "enable_zh_polish", True):
                 out = zh_polish(out)
+            # 规则化译后处理（默认开）：终助词语气、惯用句、数词单位、授受方向、主语。
+            # 放在 zh_polish 之后，避免标点归一化把刚补的语气词再改一遍。
+            if getattr(self.cfg, "enable_zh_rules", True):
+                before_rules = out
+                out, r_notes = apply_zh_rules(
+                    text, out, getattr(self.cfg, "zh_rules", "") or "")
+                if r_notes:
+                    self.last_rule_hits = r_notes
+                    self._say(f"规则[{','.join(r_notes)}] {before_rules} → {out}")
             # 术语表译文兜底：只回改诊断里实测过的坏译法（蒙汉世界→怪物猎人：世界），
             # 命中才动；用户词表不参与译后替换，避免把正常中文改回日文。
             if getattr(self.cfg, "enable_translate_glossary", False):
