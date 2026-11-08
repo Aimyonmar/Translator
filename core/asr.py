@@ -407,12 +407,14 @@ class WhisperASR:
         return self._clean(" ".join(parts).strip())
 
     def _post(self, text: str, word_map: str = "", roster: str = "") -> Optional[str]:
-        """解码之后的两级纠错：用户词表 → 人名/标题读音归一。"""
+        """解码之后的三级纠错：用户词表 → 内置错词表 → 人名/标题读音归一。"""
         if word_map:
             # 1) 精确替换表：用户写死的「误=正」，优先级最高
             text = self.apply_word_map(text, word_map)
+        # 2) 内置错词表：诊断语料里确认的同音/近音误识别，用户表没覆盖时兜底
+        text = self.apply_builtin_fixes(text)
         if roster:
-            # 2) 录音近修正：只录正确人名，按读音把听错的假名片段归一（零模型开销）
+            # 3) 录音近修正：只录正确人名，按读音把听错的假名片段归一（零模型开销）
             from .namefix import apply_names
             text = apply_names(text, roster)
         if not self._accept(text):
@@ -444,6 +446,26 @@ class WhisperASR:
         if not raw or not text:
             return text
         for wrong, right in WhisperASR.parse_word_map(raw).items():
+            if wrong in text:
+                text = text.replace(wrong, right)
+        return text
+
+    #: 内置错词表：37 句诊断语料里确认的同音/近音误识别。
+    #: 只收日语里没有其它合理解释的写法；用户 word_map 先执行，想禁用某条
+    #: 在面板里写「错=错」即可覆盖。
+    BUILTIN_FIXES = (
+        ("噛みってる", "噛んでる"),   # 噛んでる（吃螺丝）→ 曾被译成「真的在咬人」
+        ("噛みってた", "噛んでた"),
+        ("黒髪話", "黒神話"),         # 黒神話：悟空；namefix 只处理假名，汉字错法走本表
+        ("ヤチンが高", "家賃が高"),   # 家賃（房租）→ 曾被译成「你的手太高了」
+    )
+
+    @staticmethod
+    def apply_builtin_fixes(text: str) -> str:
+        """内置错词兜底：整词替换，零依赖、零请求。"""
+        if not text:
+            return text
+        for wrong, right in WhisperASR.BUILTIN_FIXES:
             if wrong in text:
                 text = text.replace(wrong, right)
         return text
