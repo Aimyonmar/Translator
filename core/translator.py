@@ -371,6 +371,17 @@ class Translator:
             pro = ja_prepare(text)
             if getattr(self.cfg, "enable_loanwords", True):
                 pro = apply_loanwords(pro)
+            # 翻译侧术语表：把专名换成人定的中文名再送翻（整词精确匹配）。
+            # 标题术语表在上游已经先做过一轮，这里只补用户/诊断新增的词，不会重复替换。
+            if getattr(self.cfg, "enable_translate_glossary", False):
+                try:
+                    from .tr_glossary import apply_source
+                    pro, g_notes = apply_source(
+                        pro, getattr(self.cfg, "translate_glossary", "") or "")
+                    for n in g_notes:
+                        self._say(f"术语替换：{n}")
+                except Exception:
+                    pass
             # 整句基本是拉丁字母（主播真在说英文，而非片假名外来语）：改走 EN→ZH 路由
             en_route = getattr(self.cfg, "enable_en_route", True) and self._looks_english(text)
             src = "en" if en_route else self.source
@@ -456,6 +467,16 @@ class Translator:
             # 规则只动词级与标点，绝不动句法——润色失败顶多不自然，不引入新错误。
             if getattr(self.cfg, "enable_zh_polish", True):
                 out = zh_polish(out)
+            # 术语表译文兜底：只回改诊断里实测过的坏译法（蒙汉世界→怪物猎人：世界），
+            # 命中才动；用户词表不参与译后替换，避免把正常中文改回日文。
+            if getattr(self.cfg, "enable_translate_glossary", False):
+                try:
+                    from .tr_glossary import apply_target
+                    out, t_notes = apply_target(out)
+                    for n in t_notes:
+                        self._say(f"术语回改：{n}")
+                except Exception:
+                    pass
             with self.lock:
                 self._cache[cache_key] = out
                 if len(self._cache) > 800:

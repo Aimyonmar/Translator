@@ -73,6 +73,11 @@ class AppConfig:
     enable_free_context: bool = False
     # 语境术语表：多行「原词=译法」，当前句出现时按此译法（仅 LLM 通道）
     context_glossary: str = ""
+    # 翻译侧术语表：多行「原文=译法」，送翻前按整词精确替换，译文里再兜底修正已知坏译法。
+    # 与 enable_title_glossary 互补：内置标题表先执行，本表只补用户/诊断里新增的专名。
+    # 默认关闭。
+    enable_translate_glossary: bool = False
+    translate_glossary: str = ""
     # 翻译
     channel: str = "auto"
     target_lang: str = "zh-Hans"
@@ -188,7 +193,7 @@ class AppConfig:
         "model_size", "asr_device", "compute_type", "source_lang", "channel", "target_lang",
         "custom_type", "custom_key", "custom_base", "custom_model", "caiyun_token",
         "last_channel", "word_map", "name_roster", "proxy", "context_glossary",
-        "transcribe_dir", "export_dir",
+        "transcribe_dir", "export_dir", "translate_glossary",
     )
 
     def _sanitize(self) -> None:
