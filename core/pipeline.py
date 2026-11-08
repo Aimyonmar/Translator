@@ -545,9 +545,6 @@ class Pipeline:
                     self.on_status(f"识别异常：{self.asr.last_error}")
                     self.asr.last_error = ""
                 continue
-            with self._seq_lock:
-                seq = self._seq
-                self._seq += 1
             # 分段计时锚点：断句 → 排队 → 识别 → 上屏原文（后续译文再记）
             try:
                 meta.update({
@@ -559,28 +556,36 @@ class Pipeline:
                 })
             except Exception:
                 meta = {}
-            # 先上屏原文：实测翻译还要 0.2~0.8 秒，画面空着等这段时间最难受
+            self._emit_text(text, meta)
+
+    # ------------------------------------------------------ 上屏
+    def _emit_text(self, text: str, meta: dict) -> None:
+        """给一段识别结果分配序号、上屏原文、再投递给翻译线程。"""
+        with self._seq_lock:
+            seq = self._seq
+            self._seq += 1
+        # 先上屏原文：实测翻译还要 0.2~0.8 秒，画面空着等这段时间最难受
+        try:
+            self.on_partial(seq, text)
+        except Exception:
+            pass
+        try:
+            meta["partial_ts"] = time.perf_counter()
+        except Exception:
+            pass
+        # 送去翻译的文本可以做「标题术语替换」（エルデンリング→艾尔登法环）：
+        # 机翻不认识游戏名（实测「原神→上帝」「エルデンリング→埃尔金戒指」），
+        # 先把中文名塞进源文里，机翻就会照抄。上屏的原文保持识别原样，所以带两份。
+        tr_text = text
+        if getattr(self.cfg, "enable_title_glossary", True):
             try:
-                self.on_partial(seq, text)
+                from .namefix import apply_title_glossary
+                tr_text = apply_title_glossary(
+                    text, self.cfg.name_roster or "",
+                    builtin=bool(getattr(self.cfg, "builtin_titles", True)))
             except Exception:
-                pass
-            try:
-                meta["partial_ts"] = time.perf_counter()
-            except Exception:
-                pass
-            # 送去翻译的文本可以做「标题术语替换」（エルデンリング→艾尔登法环）：
-            # 机翻不认识游戏名（实测「原神→上帝」「エルデンリング→埃尔金戒指」），
-            # 先把中文名塞进源文里，机翻就会照抄。上屏的原文保持识别原样，所以带两份。
-            tr_text = text
-            if getattr(self.cfg, "enable_title_glossary", True):
-                try:
-                    from .namefix import apply_title_glossary
-                    tr_text = apply_title_glossary(
-                        text, self.cfg.name_roster or "",
-                        builtin=bool(getattr(self.cfg, "builtin_titles", True)))
-                except Exception:
-                    tr_text = text
-            self._put_keep_newest(self._tr_q, (seq, tr_text, text, meta), on_drop=self._skip_seq)
+                tr_text = text
+        self._put_keep_newest(self._tr_q, (seq, tr_text, text, meta), on_drop=self._skip_seq)
 
     @staticmethod
     def _unpack_seg(item):
