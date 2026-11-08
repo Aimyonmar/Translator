@@ -495,13 +495,19 @@ class Pipeline:
                         merged += 1
             t_asr_start = time.perf_counter()
             t0 = time.time()
-            roster = self.cfg.name_roster if getattr(self.cfg, "enable_namefix", True) else ""
+            roster = ""
+            if getattr(self.cfg, "enable_namefix", True):
+                # 用户词表 + 内置标题（用户优先）：kotoba 不能开热词，
+                # 这里是 エルジェンリング→エルデンリング 这类错名的唯一纠错通道。
+                from .namefix import merge_roster
+                roster = merge_roster(self.cfg.name_roster or "")
             hotwords = ""
             if getattr(self.cfg, "enable_hotwords", True):
                 # 热词 = 用户词表 + 内置游戏/番剧标题，**汉字/片假名原样**下发
                 # （2026-10-13 实测：用假名读音反而把解码带偏，CER 7.1%→26.1%）。
+                # 这里只传用户词表，内置由 hotword_text 自己加，避免与 roster 重复。
                 from .namefix import hotword_text
-                hotwords = hotword_text(roster,
+                hotwords = hotword_text(self.cfg.name_roster or "",
                                         builtin=bool(getattr(self.cfg, "builtin_titles", True)))
             text = self.asr.transcribe(seg, word_map=self.cfg.word_map,
                                        roster=roster, hotwords=hotwords)

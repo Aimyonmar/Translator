@@ -347,6 +347,24 @@ def apply_names(text: str, raw: str) -> str:
     return _corrector(raw).fix(text)
 
 
+def merge_roster(raw: str, builtin: str = "") -> str:
+    """把用户词表与内置标题合并，用户优先。
+
+    与用户词表**读音键相同**的内置标题会被丢掉，避免同一个名字出现两种写法时
+    内置写法按长度排序抢先命中（NameCorrector 只取长名优先，不做优先级标记）。
+    """
+    if not raw:
+        return builtin or BUILTIN_TITLES
+    src = builtin or BUILTIN_TITLES
+    used = {phonetic_key(reading) for _disp, reading in parse_roster(raw)}
+    lines = [raw.strip()]
+    for disp, reading in parse_roster(src):
+        if phonetic_key(reading) in used:
+            continue
+        lines.append(f"{disp}={reading}" if disp != reading else disp)
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- 内置标题
 #: 常用游戏 / 番剧标题（日语写法）。含汉字的名词给了读音，可同时参与「音近修正」；
 #: 片假名标题天然能参与音近修正（例：エルジンリング → エルデンリング）。
