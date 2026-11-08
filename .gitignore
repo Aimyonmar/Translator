@@ -13,6 +13,9 @@ config.json.bad
 *.log
 run.log
 
+# 评测运行产物（报告与日志；baseline 与录制需要入库）
+eval/reports/
+
 # WorkBuddy 内部工作笔记（会话记忆、排查记录，不公开）
 .workbuddy/
 

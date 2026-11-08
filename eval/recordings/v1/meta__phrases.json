@@ -1,0 +1,21 @@
+{
+ "corpus_sha1": "2bb2547d6de4",
+ "ablate": [
+  "phrases"
+ ],
+ "config": {
+  "model_size": "kotoba-whisper-v2.0",
+  "beam_size": 3,
+  "min_speech_ms": 250,
+  "min_silence_ms": 400,
+  "max_speech_ms": 4000,
+  "enable_hotwords": true,
+  "builtin_titles": true,
+  "enable_namefix": true,
+  "enable_title_glossary": true,
+  "enable_translate_glossary": false,
+  "enable_zh_rules": true,
+  "enable_zh_polish": true
+ },
+ "created": "2026-11-08 02:39:59"
+}
