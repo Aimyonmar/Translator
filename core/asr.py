@@ -284,8 +284,7 @@ class WhisperASR:
         self.model = None
         self._loaded_size = None
 
-    def _retry_on_oom(self, audio: np.ndarray, word_map: str = "",
-                      roster: str = "", hotwords: str = "") -> Optional[str]:
+    def _retry_on_oom(self, audio: np.ndarray, hotwords: str = "") -> Optional[str]:
         """运行期才发现 GPU 用不了（最典型：直播中途开了游戏，显存被占爆）。
 
         自救顺序：先试「小一号模型仍留在 GPU」（medium int8 约 0.9GB，
@@ -305,8 +304,7 @@ class WhisperASR:
                 self.dev_info = f"{device}/{ct}（运行期自动降级）"
                 self.batch_size = 8 if device == "cuda" else 1
                 self.last_error = ""
-                return self.transcribe(audio, word_map=word_map,
-                                       roster=roster, hotwords=hotwords)
+                return self._decode(audio, hotwords=hotwords)
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
         return None
@@ -337,6 +335,17 @@ class WhisperASR:
 
     def transcribe(self, audio: np.ndarray, word_map: str = "",
                    roster: str = "", hotwords: str = "") -> Optional[str]:
+        raw = self._decode(audio, hotwords=hotwords)
+        if raw is None:
+            return None
+        return self._post(raw, word_map=word_map, roster=roster)
+
+    def _decode(self, audio: np.ndarray, hotwords: str = "") -> Optional[str]:
+        """只跑解码，返回清洗后的原始识别文本，不做词表 / 人名纠错。
+
+        评测的录制—回放在这一层截断：录下解码结果，回放时原样返回，
+        之后仍走 `_post`，这样纠错类开关的 A/B 作用在同一份原始输出上。
+        """
         if self.model is None or audio is None or len(audio) < 1600:
             return None
         audio = np.asarray(audio, dtype=np.float32)
@@ -393,10 +402,12 @@ class WhisperASR:
         except Exception as exc:
             # 绝不静默吞掉：记下来，并按「GPU 小模型 → CPU 小模型」自救一次
             self.last_error = f"{type(exc).__name__}: {exc}"
-            return self._retry_on_oom(audio, word_map, roster, hotwords)
+            return self._retry_on_oom(audio, hotwords=hotwords)
 
-        text = " ".join(parts).strip()
-        text = self._clean(text)
+        return self._clean(" ".join(parts).strip())
+
+    def _post(self, text: str, word_map: str = "", roster: str = "") -> Optional[str]:
+        """解码之后的两级纠错：用户词表 → 人名/标题读音归一。"""
         if word_map:
             # 1) 精确替换表：用户写死的「误=正」，优先级最高
             text = self.apply_word_map(text, word_map)
