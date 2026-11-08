@@ -226,6 +226,17 @@ class ControlPanel(QWidget):
         title_col.addWidget(lbl_sub)
         head.addLayout(title_col)
         head.addStretch(1)
+        # 本场链路计数：只读展示，与 eval 的 finals/with_tgt 同口径。
+        # 固定最小宽度，数字变长时不推挤右侧的音量条（避免可见抖动）。
+        self.lbl_counts = QLabel("")
+        self.lbl_counts.setObjectName("hint")
+        self.lbl_counts.setMinimumWidth(310)
+        self.lbl_counts.setToolTip(
+            "本场实时统计（只读，不参与翻译决策）：\n"
+            "上屏 = 已显示的句子数；有译文 = 其中译文非空；\n"
+            "失败 = 译文为空（原文兜底）；已标错 = 写入 feedback.jsonl 的条数；\n"
+            "与 eval 报告的 finals / with_tgt 同口径，关闭标错后前四项照常统计。")
+        self._refresh_counts()
         self.lbl_state = QLabel("未启动")
         self.lbl_state.setObjectName("stateValue")
         self.bar = QProgressBar()
@@ -234,6 +245,7 @@ class ControlPanel(QWidget):
         self.bar.setTextVisible(False)
         lbl_vol = QLabel("音量")
         lbl_vol.setObjectName("hint")
+        head.addWidget(self.lbl_counts)
         head.addWidget(self.lbl_state)
         head.addWidget(lbl_vol)
         head.addWidget(self.bar)
@@ -1314,6 +1326,7 @@ class ControlPanel(QWidget):
         else:
             self._refresh_feedback_ui()
         self._live_render()
+        self._refresh_counts()
 
     def _on_live_line(self, seq: int, src: str, tgt: str) -> None:
         """译文回来：按 seq 回填同一行；停止后才到的译文也能回填。"""
@@ -1335,6 +1348,7 @@ class ControlPanel(QWidget):
             self._live_records[idx] = (a, b, src or old_src, tgt)
         self._live_open.pop(seq, None)
         self._live_render()
+        self._refresh_counts()
 
     def _live_render(self) -> None:
         from core.transcribe import format_ts
@@ -1580,6 +1594,21 @@ class ControlPanel(QWidget):
             return ("live", back)
         return None
 
+    def _refresh_counts(self) -> None:
+        """刷新顶栏本场计数。数据源是 pipeline.counts()（只读快照），不做任何计算。"""
+        c = {}
+        pipe = self._fb_pipeline()
+        if pipe is not None and hasattr(pipe, "counts"):
+            try:
+                c = pipe.counts()
+            except Exception:
+                c = {}
+        text = "上屏 %d · 有译文 %d · 失败 %d · 标错 %d" % (
+            int(c.get("final", 0)), int(c.get("tgt", 0)),
+            int(c.get("fail", 0)), int(self._fb_count))
+        if self.lbl_counts.text() != text:
+            self.lbl_counts.setText(text)
+
     def _refresh_feedback_ui(self) -> None:
         on = bool(getattr(self.cfg, "enable_feedback", True))
         for cb in self._fb_tags.values():
@@ -1671,6 +1700,7 @@ class ControlPanel(QWidget):
         ok = bool(store.submit(entry))
         if ok:
             self._fb_count += 1
+            self._refresh_counts()
             names = "/".join(feedback.TAG_NAMES.get(t, t) for t in entry["tags"])
             self._log("已标错 #%d：%s · %s" % (self._fb_count, where, names))
             self.btn_fb.setText("已记录")
@@ -1915,6 +1945,7 @@ class ControlPanel(QWidget):
             self._live_origin = self._live_frozen
             self._live_render()
         self._refresh_feedback_ui()
+        self._refresh_counts()
         self.btn_start.setText("停止翻译" if running else "开始翻译")
         # 动态属性 + 重新 polish：让 QSS 里 [running="true"] 那套配色生效
         self.btn_start.setProperty("running", "true" if running else "false")

@@ -74,6 +74,11 @@ class Pipeline:
         self.recent = feedback.RecentSentences(feedback.RECENT_MAX)
         self.session_id = ""
         self._session_t0 = time.time()
+        # 链路计数：与 bench 的 finals_n / trans_fail 同口径，都按「on_result 上屏一次」记。
+        # 只做只读统计，不参与任何翻译/识别决策；关掉标错也照常记（它统计的是链路本身）。
+        # 需要锁只是因为翻译线程有 2 条，自增本身是纳秒级，不进任何阻塞路径。
+        self._count_lock = threading.Lock()
+        self._counts = {"final": 0, "tgt": 0, "fail": 0}
 
     # ------------------------------------------------------------ 控制
     def start(self) -> None:
@@ -99,6 +104,8 @@ class Pipeline:
         self.session_id = feedback.new_session_id("live")
         self._session_t0 = time.time()
         self.recent.clear()
+        with self._count_lock:
+            self._counts = {"final": 0, "tgt": 0, "fail": 0}
         self.state = "loading"
         self.on_status("正在准备模型…")
         threading.Thread(target=self._boot, args=(stop_evt,), daemon=True).start()
@@ -253,6 +260,11 @@ class Pipeline:
     def session_start_wall(self) -> float:
         """本轮开始时的墙钟时间，用来把快照里的相对秒换成时间戳。"""
         return self._session_t0
+
+    def counts(self) -> dict:
+        """本场链路计数快照：上屏句数 / 有译文 / 翻译失败（原文兜底）。只读。"""
+        with self._count_lock:
+            return dict(self._counts)
 
     def restart_audio(self) -> None:
         """切换设备后重新采集，不影响已加载的模型。"""
@@ -767,6 +779,11 @@ class Pipeline:
                     )
                 except Exception:
                     pass
+            # 计数先于回调：面板在 on_result 里就会刷新顶栏，先记账才不会读到上一句的数字。
+            # 口径与 bench 一致（每次 on_result 记一条，译文为空记 fail）。
+            with self._count_lock:
+                self._counts["final"] += 1
+                self._counts["tgt" if out else "fail"] += 1
             try:
                 # 翻译失败也要把原文顶上去，别让字幕一片空白
                 self.on_result(seq, disp_text, out)

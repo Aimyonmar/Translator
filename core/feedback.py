@@ -10,6 +10,7 @@
 
 统计命令：
     .runtime\\venv\\Scripts\\python.exe -m core.feedback --stats
+    .runtime\\venv\\Scripts\\python.exe -m core.feedback --analyze
 """
 from __future__ import annotations
 
@@ -26,8 +27,9 @@ from typing import Deque, Dict, List, Optional
 
 __all__ = [
     "FEEDBACK_PATH", "RECENT_MAX", "TAGS", "TAG_NAMES", "new_session_id",
-    "RecentSentences", "FeedbackWriter", "load_entries", "summarize",
+    "RecentSentences", "FeedbackWriter", "load_entries", "summarize", "analyze",
     "config_snapshot", "model_snapshot", "make_entry",
+    "MIN_TOTAL", "MIN_CELL", "LEN_BINS",
 ]
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -355,6 +357,172 @@ def summarize(entries: List[dict]) -> Dict:
     }
 
 
+# ---------------------------------------------------------------- 交叉分析
+# 小样本阈值：少于 20 条时，「集中在哪一类」很可能只是几条噪声的巧合；
+# 单个单元少于 5 条时同样只列数字、不下判断。阈值写死在这里，别在报告里各说各话。
+MIN_TOTAL = 20
+MIN_CELL = 5
+
+# 句长按原文（日语）字符数分档：短句多为应答/语气词，长句才容易暴露断句与译序问题
+LEN_BINS = ((1, 5, "1~5 字"), (6, 10, "6~10 字"), (11, 20, "11~20 字"),
+            (21, 40, "21~40 字"), (41, 10 ** 9, "41 字以上"))
+LEN_EMPTY = "空"
+
+
+def _len_bin(text: str) -> str:
+    n = len((text or "").strip())
+    if n <= 0:
+        return LEN_EMPTY
+    for lo, hi, name in LEN_BINS:
+        if lo <= n <= hi:
+            return name
+    return LEN_BINS[-1][2]
+
+
+def _minute_bucket(entry: dict, session_t0: Optional[float]) -> Optional[int]:
+    """会话内第几分钟（0 起）。优先用 start_s（相对本轮开始），缺失时用落盘时间差。"""
+    s = entry.get("start_s")
+    if isinstance(s, (int, float)) and s >= 0:
+        return int(s // 60)
+    ts = entry.get("ts_unix")
+    if isinstance(ts, (int, float)) and isinstance(session_t0, (int, float)):
+        return max(0, int((ts - session_t0) // 60))
+    return None
+
+
+def analyze(entries: List[dict]) -> Dict:
+    """多维交叉统计：类型 / 通道 / 模型 / 句长 / 会话内时间。
+
+    只读 jsonl 里已有字段，不改 schema。标签为空记「(未填)」，通道/模型缺失记「(未知)」，
+    不丢弃任何一条 —— 否则「总数」和 --stats 就对不上。
+    """
+    total = len(entries)
+    by_tag: Counter = Counter()
+    by_channel: Counter = Counter()
+    by_model: Counter = Counter()
+    by_len: Counter = Counter()
+    by_minute: Counter = Counter()
+    pair_tc: Counter = Counter()     # (错误类型, 通道)
+    pair_tl: Counter = Counter()     # (错误类型, 句长档)
+
+    # 会话起点：同一 session_id 的最早落盘时间，仅在 start_s 缺失时兜底用
+    session_t0: Dict[str, Optional[float]] = {}
+    for e in entries:
+        sid = e.get("session_id") or "(无会话)"
+        ts = e.get("ts_unix")
+        if isinstance(ts, (int, float)):
+            old = session_t0.get(sid)
+            if old is None or ts < old:
+                session_t0[sid] = ts
+        else:
+            session_t0.setdefault(sid, None)
+
+    for e in entries:
+        tags = [TAG_NAMES.get(t, t) for t in (e.get("tags") or []) if t] or ["(未填)"]
+        ch = e.get("channel_name") or e.get("channel") or "(未知)"
+        model = (e.get("model") or {}).get("asr") or "(未知)"
+        lb = _len_bin(e.get("src", ""))
+        sid = e.get("session_id") or "(无会话)"
+        minute = _minute_bucket(e, session_t0.get(sid))
+        by_channel[ch] += 1
+        by_model[model] += 1
+        by_len[lb] += 1
+        by_minute[minute if minute is not None else -1] += 1
+        for t in tags:
+            by_tag[t] += 1
+            pair_tc[(t, ch)] += 1
+            pair_tl[(t, lb)] += 1
+
+    sample_ok = total >= MIN_TOTAL
+    findings: List[str] = []
+    if total == 0:
+        findings.append("0 条记录：没有样本，任何分布结论都不成立。")
+    elif not sample_ok:
+        findings.append("样本 %d 条 < %d 条阈值：只列分布，不下「集中在哪」的结论。"
+                        % (total, MIN_TOTAL))
+    else:
+        dims = (("错误类型", by_tag, "次"), ("翻译通道", by_channel, "条"),
+                ("句子长度", by_len, "条"))
+        for name, counter, unit in dims:
+            if not counter:
+                continue
+            key, cnt = counter.most_common(1)[0]
+            if cnt < MIN_CELL:
+                findings.append("%s没有占优项：最高「%s」只有 %d %s，低于单元阈值 %d。"
+                                % (name, key, cnt, unit, MIN_CELL))
+                continue
+            share = 100.0 * cnt / total
+            note = "（多选，占比可超 100%）" if name == "错误类型" else ""
+            findings.append("%s集中在「%s」：%d %s，占条目 %.0f%%%s。"
+                            % (name, key, cnt, unit, share, note))
+        if by_minute:
+            key, cnt = by_minute.most_common(1)[0]
+            if cnt >= MIN_CELL:
+                label = "(时间不可用)" if key < 0 else "第 %d 分钟" % (key + 1)
+                findings.append("时间上集中在%s：%d 条。" % (label, cnt))
+            else:
+                findings.append("时间分布没有占优分钟：最高仅 %d 条，低于单元阈值 %d。"
+                                % (cnt, MIN_CELL))
+
+    def _pairs(counter: Counter, right: str) -> List[dict]:
+        return [{"tag": a, right: b, "n": n}
+                for (a, b), n in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))][:10]
+
+    return {
+        "total": total,
+        "sample_ok": sample_ok,
+        "min_total": MIN_TOTAL,
+        "min_cell": MIN_CELL,
+        "by_tag": dict(by_tag.most_common()),
+        "by_channel": dict(by_channel.most_common()),
+        "by_model": dict(by_model.most_common()),
+        "by_len": dict(by_len.most_common()),
+        "by_minute": {("(时间不可用)" if k < 0 else "第 %d 分钟" % (k + 1)): v
+                      for k, v in sorted(by_minute.items())},
+        "cross": {
+            "tag_channel": _pairs(pair_tc, "channel"),
+            "tag_len": _pairs(pair_tl, "len"),
+        },
+        "findings": findings,
+    }
+
+
+def _fmt_counter(counter: Dict[str, int], total: int, unit: str = "条") -> None:
+    for k, v in counter.items():
+        share = (100.0 * v / total) if total else 0.0
+        warn = "  ← 低于单元阈值" if v < MIN_CELL else ""
+        print("  %-16s %3d %s (%4.1f%%)%s" % (k, v, unit, share, warn))
+
+
+def _print_analyze(rows: List[dict], as_json: bool = False) -> None:
+    a = analyze(rows)
+    if as_json:
+        print(json.dumps(a, ensure_ascii=False, indent=2))
+        return
+    print("标错条目：%d 条（结论阈值：总计 ≥%d 条、单元 ≥%d 条）"
+          % (a["total"], a["min_total"], a["min_cell"]))
+    print("\n结论")
+    for line in a["findings"]:
+        print("  - " + line)
+    if a["total"]:
+        print("\n按错误类型")
+        _fmt_counter(a["by_tag"], a["total"], "次")
+        print("\n按翻译通道")
+        _fmt_counter(a["by_channel"], a["total"])
+        print("\n按识别模型")
+        _fmt_counter(a["by_model"], a["total"])
+        print("\n按句长（原文去空白后字数）")
+        _fmt_counter(a["by_len"], a["total"])
+        print("\n按会话内时间")
+        _fmt_counter(a["by_minute"], a["total"])
+        print("\n交叉：错误类型 × 通道（前 10）")
+        for row in a["cross"]["tag_channel"]:
+            print("  %-12s @ %-14s %3d" % (row["tag"], row["channel"], row["n"]))
+        print("\n交叉：错误类型 × 句长（前 10）")
+        for row in a["cross"]["tag_len"]:
+            print("  %-12s @ %-12s %3d" % (row["tag"], row["len"], row["n"]))
+
+
 def _print_stats(rows: List[dict], as_json: bool = False) -> None:
     s = summarize(rows)
     if as_json:
@@ -378,8 +546,10 @@ def _print_stats(rows: List[dict], as_json: bool = False) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="标错记录的读取与统计")
-    ap.add_argument("--stats", action="store_true", help="输出统计（默认）")
-    ap.add_argument("--json", action="store_true", help="以 JSON 输出统计结果")
+    ap.add_argument("--stats", action="store_true", help="按类型/通道/模型统计（默认）")
+    ap.add_argument("--analyze", action="store_true",
+                    help="交叉分析：类型 × 通道 × 句长 × 会话内时间，带小样本判定")
+    ap.add_argument("--json", action="store_true", help="以 JSON 输出")
     ap.add_argument("--path", default="", help="覆盖 jsonl 路径（默认 .runtime/feedback.jsonl）")
     args = ap.parse_args(argv)
     path = args.path or FEEDBACK_PATH
@@ -387,9 +557,15 @@ def main(argv=None) -> int:
     if not args.stats and not args.json:
         print("文件：%s" % path)
         if not rows:
+            if args.analyze:      # 0 条也要给出「样本不足」的判定，便于确认阈值生效
+                _print_analyze(rows, as_json=False)
+                return 0
             print("还没有标错记录。")
             return 0
-    _print_stats(rows, as_json=args.json)
+    if args.analyze:
+        _print_analyze(rows, as_json=args.json)
+    else:
+        _print_stats(rows, as_json=args.json)
     return 0
 
 
