@@ -4,15 +4,32 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
 import threading
-from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, Optional
+import traceback
+from dataclasses import dataclass, asdict, field, MISSING
+from typing import Any, Dict, List, Optional
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 
 # 主线程、翻译线程（Translator._remember）、设备探测线程都会调 save()。
 # 不加锁时两个线程可能同时写同一文件，写出半截 JSON，下次启动配置直接回落默认值。
 _SAVE_LOCK = threading.Lock()
+
+
+def _caller() -> str:
+    """第一个 config.py 之外的调用点，用于告警里指认是谁想写盘。"""
+    here = os.path.abspath(__file__)
+    for fr in reversed(traceback.extract_stack()[:-2]):
+        if os.path.abspath(fr.filename) != here:
+            return "%s:%d in %s()" % (fr.filename, fr.lineno, fr.name)
+    return "(未知调用点)"
+
+
+def _warn(msg: str) -> None:
+    print("[config] " + msg, file=sys.stderr, flush=True)
+
 
 
 def _clamp(value: Any, lo, hi, cast):
@@ -167,21 +184,54 @@ class AppConfig:
     screen_index: int = 0
     show_panel: bool = True
 
-    def save(self) -> None:
-        """原子写：先写临时文件再替换，避免中途失败/并发写留下半截 JSON。"""
-        data = asdict(self)
-        tmp = CONFIG_PATH + ".tmp"
+    def __post_init__(self) -> None:
+        # 写盘闸门：只有真实应用入口用 load(interactive=True) 拿到的实例才允许落盘。
+        # 脚本/测试/回放默认只读，save() 直接拒绝并打印调用点，从机制上堵住配置污染。
+        self._interactive = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def save(self, reason: str = "") -> bool:
+        """校验 → 备份 → 临时文件 → 原子替换；返回是否真的写了文件。
+
+        非交互实例一律拒绝（告警含调用点）；校验失败、备份失败、写盘异常时原文件不动。
+        """
+        if not getattr(self, "_interactive", False):
+            _warn("拒绝写盘：非交互加载的 AppConfig 调用了 save()%s；调用点 %s。"
+                  "真实应用请用 AppConfig.load(interactive=True)，"
+                  "脚本/测试请用 core.config.patch_config_save(cfg)。"
+                  % ("（reason=%s）" % reason if reason else "", _caller()))
+            return False
+        data = self.to_dict()
+        errs = validate_config(data)
+        if errs:
+            for e in errs:
+                _warn("拒绝写盘：%s（原文件未改动）" % e)
+            return False
         with _SAVE_LOCK:
+            path = CONFIG_PATH
+            bak = path + ".bak"
+            tmp = path + ".tmp"
             try:
+                if os.path.exists(path):
+                    # 先留一份「上一次有效值」，写坏了还能手工回滚
+                    shutil.copy2(path, bak)
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
-                os.replace(tmp, CONFIG_PATH)
-            except Exception:
+                    f.flush()
+                    os.fsync(f.fileno())
+                # 同目录 replace 是原子的：要么旧文件，要么完整新文件，不会出现半截 JSON
+                os.replace(tmp, path)
+            except Exception as exc:
                 try:
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 except Exception:
                     pass
+                _warn("写盘失败（%s: %s），原文件未改动" % (exc.__class__.__name__, exc))
+                return False
+        return True
 
     # 数值字段的合法区间：(下限, 上限, 类型)。config.json 是用户可手改的边界，
     # 越界/类型错误在这里夹回安全范围，别让 int(None) 之类的问题拖到界面构造或 VAD 里才炸。
@@ -241,7 +291,7 @@ class AppConfig:
             self.model_size = "small"
 
     @classmethod
-    def load(cls) -> "AppConfig":
+    def load(cls, interactive: bool = False) -> "AppConfig":
         cfg = cls()
         if not os.path.exists(CONFIG_PATH):
             return cfg
@@ -262,4 +312,58 @@ class AppConfig:
             except Exception:
                 pass
         cfg._sanitize()
+        cfg._interactive = bool(interactive)
         return cfg
+
+
+def validate_config(data: Dict[str, Any]) -> List[str]:
+    """写前校验：键集合与 AppConfig 字段一致、类型正确、数值在 _NUM_RANGES 内。
+
+    返回问题列表；空列表表示可以写盘。只做检查，不改数据。
+    """
+    errs: List[str] = []
+    fields = AppConfig.__dataclass_fields__
+    for k in data:
+        if k not in fields:
+            errs.append("未知键 %r" % k)
+    for name, f in fields.items():
+        if name not in data:
+            errs.append("缺少键 %r" % name)
+            continue
+        v = data[name]
+        default = None if f.default is MISSING else f.default
+        if isinstance(default, bool):
+            if not isinstance(v, bool):
+                errs.append("键 %r 需要 bool，实际 %s" % (name, type(v).__name__))
+        elif isinstance(default, int):
+            if isinstance(v, bool) or not isinstance(v, int):
+                errs.append("键 %r 需要 int，实际 %s" % (name, type(v).__name__))
+        elif isinstance(default, float):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                errs.append("键 %r 需要 float，实际 %s" % (name, type(v).__name__))
+        elif isinstance(default, str):
+            if not isinstance(v, str):
+                errs.append("键 %r 需要 str，实际 %s" % (name, type(v).__name__))
+    for name, (lo, hi, _cast) in AppConfig._NUM_RANGES.items():
+        v = data.get(name)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue          # 类型问题上面已单独报过
+        if not (lo <= v <= hi):
+            errs.append("键 %r 越界：%s 不在 %s~%s" % (name, v, lo, hi))
+    for name in ("device", "geometry"):
+        v = data.get(name)
+        if v is not None and not isinstance(v, dict):
+            errs.append("键 %r 需要 dict 或 null，实际 %s" % (name, type(v).__name__))
+    return errs
+
+
+def patch_config_save(cfg: Optional[AppConfig] = None) -> AppConfig:
+    """测试/脚本一行禁用写盘：不落盘、不告警。
+
+    用法：cfg = patch_config_save(AppConfig.load()) 或 patch_config_save(cfg)
+    """
+    if cfg is None:
+        cfg = AppConfig()
+    cfg._interactive = False
+    cfg.save = lambda *a, **k: False
+    return cfg

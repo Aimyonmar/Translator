@@ -118,7 +118,8 @@ class AppController:
         self._quitting = False          # 退出收尾只跑一次（面板关闭/托盘退出可能同时触发）
         self._trs_busy = False          # 音频转文字进行中：与实时字幕互斥
         self._trs_cancel = threading.Event()
-        self.cfg = AppConfig.load()
+        # 唯一的写盘许可入口：真实应用启动。脚本/测试用默认的只读加载。
+        self.cfg = AppConfig.load(interactive=True)
         # 标错写手随程序启动：后台线程只做追加写，面板按键只是入队
         self.feedback = feedback.FeedbackWriter()
         self.pipeline = Pipeline(self.cfg)
