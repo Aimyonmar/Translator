@@ -773,6 +773,24 @@ class ControlPanel(QWidget):
         row_fb.addWidget(self.lbl_fb, 1)
         v_live.addLayout(row_fb)
 
+        # 全量记录：与标错分开，默认关闭。只是回看素材，没有参考译文，不能当判错结果。
+        row_log = QHBoxLayout()
+        self.chk_live_log = QCheckBox("全量记录（回看用）")
+        self.chk_live_log.setChecked(bool(getattr(self.cfg, "enable_live_log", False)))
+        self.chk_live_log.setToolTip(
+            "开启后每句上屏都把原文/译文写进 .runtime/live/live-YYYYMMDD.jsonl；\n"
+            "按天分片，保留最近 %d 天、总量上限 %d MB，超限从最旧的文件开始删。\n"
+            "全量记录不等于判错：没有参考译文，无法自动判断对错，只用于回看与导出。"
+            % (int(getattr(self.cfg, "live_log_keep_days", 7)),
+               int(getattr(self.cfg, "live_log_max_mb", 200))))
+        self.chk_live_log.toggled.connect(self._on_live_log_toggle)
+        self.lbl_live_log = QLabel("只做回看，不参与判错")
+        self.lbl_live_log.setObjectName("hint")
+        row_log.addWidget(self.chk_live_log)
+        row_log.addWidget(self.lbl_live_log)
+        row_log.addStretch(1)
+        v_live.addLayout(row_log)
+
         row_tags = QHBoxLayout()
         lbl_tags = QLabel("错误类型")
         lbl_tags.setObjectName("hint")
@@ -1631,6 +1649,14 @@ class ControlPanel(QWidget):
             pass
         self._apply_hotkey()
         self._refresh_feedback_ui()
+
+    def _on_live_log_toggle(self, checked: bool) -> None:
+        """全量记录开关：只影响是否落盘，不参与翻译/识别，也不产生标错记录。"""
+        self.cfg.enable_live_log = bool(checked)
+        try:
+            self._save_cfg()
+        except Exception:
+            pass
 
     def _on_fb_back_changed(self, _v: int) -> None:
         if self._fb_syncing:

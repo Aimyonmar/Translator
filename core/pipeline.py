@@ -72,6 +72,8 @@ class Pipeline:
         # 标错用最近句快照：只存内存、只在上屏/译文回来时各更新一次，
         # 关闭 enable_feedback 后一次都不写（见 core/feedback.py）。
         self.recent = feedback.RecentSentences(feedback.RECENT_MAX)
+        # 全量记录写手（回看用，不等于判错）：首次需要时才建，关闭开关时恒为 None
+        self._live = None
         self.session_id = ""
         self._session_t0 = time.time()
         # 链路计数：与 bench 的 finals_n / trans_fail 同口径，都按「on_result 上屏一次」记。
@@ -608,6 +610,12 @@ class Pipeline:
                 self.recent.add_text(seq, text, time.time() - self._session_t0)
             except Exception:
                 pass
+        if getattr(self.cfg, "enable_live_log", False):
+            try:
+                # 会话内起始秒：上屏时就固定，译文回来后仍用这个起点
+                meta["log_start_s"] = round(time.time() - self._session_t0, 3)
+            except Exception:
+                pass
         try:
             meta["partial_ts"] = time.perf_counter()
         except Exception:
@@ -658,6 +666,31 @@ class Pipeline:
         with self._seq_lock:
             if seq >= self._next_seq:
                 self._skipped.add(seq)
+
+    def _live_log(self, seq: int, src: str, tgt: str, meta: dict) -> None:
+        """全量记录：只入队，落盘在 feedback.LiveLogWriter 的后台线程。
+
+        开关关闭时直接返回；开启后 submit 是微秒级，队列满则丢弃并计数，
+        不会反压字幕线程。记录只用于回看，不代表判错。
+        """
+        if not getattr(self.cfg, "enable_live_log", False):
+            return
+        try:
+            if self._live is None:
+                self._live = feedback.LiveLogWriter(
+                    keep_days=int(getattr(self.cfg, "live_log_keep_days",
+                                          feedback.LIVE_KEEP_DAYS)),
+                    max_mb=int(getattr(self.cfg, "live_log_max_mb",
+                                       feedback.LIVE_MAX_MB)))
+            self._live.submit(feedback.live_entry(
+                cfg=self.cfg, session_id=self.session_id, seq=seq,
+                src=src, tgt=tgt,
+                channel=meta.get("channel") or self.translator.last_channel(),
+                start_s=meta.get("log_start_s"),
+                end_s=time.time() - self._session_t0,
+                pipeline=self))
+        except Exception:
+            pass
 
     # 允许积压的识别工作量（秒）。超出就把最旧的丢掉，保证字幕跟得上当下。
     ASR_PENDING_SEC = 3.0
@@ -802,6 +835,7 @@ class Pipeline:
                                            time.time() - self._session_t0)
                 except Exception:
                     pass
+            self._live_log(seq, disp_text, out or "", meta)
             # 只在真正上屏后入窗：并行翻译回包是乱序的，按上屏顺序记才不会错位
             try:
                 self.context.push(disp_text, out)

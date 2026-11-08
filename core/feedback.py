@@ -27,7 +27,8 @@ from typing import Deque, Dict, List, Optional
 
 __all__ = [
     "FEEDBACK_PATH", "RECENT_MAX", "TAGS", "TAG_NAMES", "new_session_id",
-    "RecentSentences", "FeedbackWriter", "load_entries", "summarize", "analyze",
+    "RecentSentences", "FeedbackWriter", "LiveLogWriter", "live_path", "live_entry",
+    "load_entries", "summarize", "analyze",
     "config_snapshot", "model_snapshot", "make_entry",
     "MIN_TOTAL", "MIN_CELL", "LEN_BINS",
 ]
@@ -226,6 +227,193 @@ class FeedbackWriter:
             os.replace(self.path, self.path + ".1")
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------- 全量记录
+# 与标错分开：这里每句都写，用于回看/导出，不代表判错（没有参考译文，无法自动评分）。
+LIVE_DIR = os.path.join(RUNTIME_DIR, "live")
+LIVE_KEEP_DAYS = 7
+LIVE_MAX_MB = 200
+# 队列上限：按每条约 0.3~1KB、写手每秒可写数千条算，2048 条足够吸收磁盘抖动；
+# 满了丢新条目并计数，绝不反压字幕线程。
+LIVE_QUEUE = 2048
+
+
+def live_path(folder: Optional[str] = None, day: Optional[str] = None) -> str:
+    return os.path.join(folder or LIVE_DIR,
+                        "live-%s.jsonl" % (day or time.strftime("%Y%m%d")))
+
+
+def live_entry(*, cfg, session_id: str, seq: int, src: str, tgt: str,
+               channel: str, start_s: Optional[float] = None,
+               end_s: Optional[float] = None, pipeline=None,
+               source: str = "live") -> Dict:
+    """全量记录的一行：字段命名与 feedback.jsonl 对齐，便于同一个脚本读。"""
+    now = time.time()
+    return {
+        "ts": datetime.fromtimestamp(now).astimezone().isoformat(timespec="milliseconds"),
+        "ts_unix": round(now, 3),
+        "session_id": session_id,
+        "source": source,
+        "seq": int(seq),
+        "start_s": None if start_s is None else round(float(start_s), 3),
+        "end_s": None if end_s is None else round(float(end_s), 3),
+        "src": src or "",
+        "tgt": tgt or "",
+        "channel": channel or "",
+        "channel_name": CHANNEL_NAMES.get(channel, channel) if channel else "",
+        "model": model_snapshot(cfg, pipeline),
+    }
+
+
+class LiveLogWriter:
+    """按天分片的全量写手：submit() 只入队，序列化与落盘全在后台线程。
+
+    内存只受队列上限约束（LIVE_QUEUE 条），与已写条数无关；写满后丢弃并计数，
+    不会无限堆积。保留策略：保留最近 keep_days 天，且全部文件总量不超过 max_mb，
+    超限从最旧的文件开始删，当前正在写的文件永不删除。
+    """
+
+    def __init__(self, folder: Optional[str] = None, max_queue: int = LIVE_QUEUE,
+                 keep_days: int = LIVE_KEEP_DAYS, max_mb: int = LIVE_MAX_MB):
+        self.folder = folder or LIVE_DIR
+        self.keep_days = max(1, int(keep_days))
+        self.max_bytes = max(1, int(max_mb)) * 1024 * 1024
+        self._q: "queue.Queue[dict]" = queue.Queue(maxsize=max(8, int(max_queue)))
+        self._lock = threading.Lock()
+        self._stats: Counter = Counter()
+        self._stop = threading.Event()
+        self._cur_day = ""
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="live-log-writer")
+        self._thread.start()
+
+    # ---------------------------------------------------------- 对外
+    def submit(self, entry: Dict) -> bool:
+        """入队即返回，返回 False 表示已丢弃（队列满/异常），只影响记录完整性。"""
+        try:
+            self._q.put_nowait(entry)
+        except queue.Full:
+            self._bump("dropped")
+            return False
+        except Exception:
+            self._bump("failed")
+            return False
+        self._bump("queued")
+        return True
+
+    def flush(self, timeout: float = 2.0) -> bool:
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            if self._q.unfinished_tasks == 0:
+                return True
+            time.sleep(0.01)
+        return self._q.unfinished_tasks == 0
+
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._stats)
+
+    def close(self, timeout: float = 2.0) -> None:
+        self.flush(timeout)
+        self._stop.set()
+        try:
+            self._thread.join(timeout=1.0)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------- 后台
+    def _bump(self, key: str, n: int = 1) -> None:
+        with self._lock:
+            self._stats[key] += n
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                first = self._q.get(timeout=0.2)
+            except queue.Empty:
+                if self._stop.is_set():
+                    break
+                continue
+            batch = [first]
+            while True:
+                try:
+                    batch.append(self._q.get_nowait())
+                except queue.Empty:
+                    break
+            lines: List[str] = []
+            for row in batch:
+                try:
+                    lines.append(json.dumps(row, ensure_ascii=False,
+                                            separators=(",", ":")))
+                except Exception:
+                    self._bump("failed")
+            try:
+                if lines:
+                    self._append(lines)
+                    self._bump("written", len(lines))
+            except Exception:
+                self._bump("failed", len(lines))
+            finally:
+                for _ in batch:
+                    try:
+                        self._q.task_done()
+                    except Exception:
+                        pass
+
+    def _append(self, lines: List[str]) -> None:
+        os.makedirs(self.folder, exist_ok=True)
+        day = time.strftime("%Y%m%d")
+        if day != self._cur_day:
+            self._cur_day = day
+            # 换天时做一次保留清理：只删旧分片，当前文件不在候选里
+            self._cleanup(keep_path=live_path(self.folder, day))
+        payload = "".join(line + "\n" for line in lines)
+        with open(live_path(self.folder, day), "a", encoding="utf-8",
+                  newline="\n") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _cleanup(self, keep_path: str) -> None:
+        try:
+            names = [n for n in os.listdir(self.folder)
+                     if n.startswith("live-") and n.endswith(".jsonl")]
+        except OSError:
+            return
+        rows = []
+        for n in names:
+            p = os.path.join(self.folder, n)
+            if os.path.abspath(p) == os.path.abspath(keep_path):
+                continue
+            try:
+                rows.append((os.path.getmtime(p), os.path.getsize(p), p))
+            except OSError:
+                continue
+        rows.sort()
+        cutoff = time.time() - self.keep_days * 86400
+        for mtime, _size, p in list(rows):
+            if mtime < cutoff:
+                try:
+                    os.remove(p)
+                    self._bump("expired")
+                    rows.remove((mtime, _size, p))
+                except OSError:
+                    pass
+        # 容量上限把当前文件也算进去，但只删旧分片；当前文件永不删
+        try:
+            total = os.path.getsize(keep_path) + sum(r[1] for r in rows)
+        except OSError:
+            total = sum(r[1] for r in rows)
+        for _mtime, size, p in rows:
+            if total <= self.max_bytes:
+                break
+            try:
+                os.remove(p)
+                total -= size
+                self._bump("expired")
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------- 快照

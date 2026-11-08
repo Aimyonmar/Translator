@@ -149,6 +149,11 @@ class AppConfig:
     # 标错热键：Windows 全局注册（面板在后台/游戏前台也能触发）。
     # Ctrl+Alt+M 比 Ctrl+Shift+M 更少和常见软件冲突；至少含 Ctrl/Alt/Win。
     feedback_hotkey: str = "Ctrl+Alt+M"
+    # 全量记录：每句上屏就把原文/译文写进 .runtime/live/live-YYYYMMDD.jsonl，
+    # 供回看与导出。默认关闭——它只记录、不判错，且会把整场内容落盘，属于明显的体积/隐私选择。
+    enable_live_log: bool = False
+    live_log_keep_days: int = 7       # 按天分片，保留最近 7 天
+    live_log_max_mb: int = 200        # 全部 live 文件总容量上限（MB），超了删最旧
     # 音频预处理：轻量谱减法降噪，压低稳态背景噪声（风扇/电流声/低频隆隆）。
     # 对 BGM 这类非稳态音乐帮助有限（那需要人声分离模型），但能改善整体信噪比。
     enable_denoise: bool = True
@@ -278,6 +283,8 @@ class AppConfig:
         "window_width": (0, 10000, int),
         "screen_index": (0, 16, int),
         "trs_max_chars": (0, 200, int),
+        "live_log_keep_days": (1, 90, int),
+        "live_log_max_mb": (10, 5000, int),
     }
 
     _STR_FIELDS = (
