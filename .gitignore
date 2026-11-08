@@ -5,9 +5,10 @@
 .runtime/
 
 # 本机生成的配置（设备、窗口位置、通道偏好；填入的 API Key 也存在这里）
-# config.json.bad 是解析失败时的自动备份，同样含密钥，一律不入库
+# config.json.* 兜住自动备份与临时文件：.bad（解析失败备份）、.bak（写盘前备份）、
+# .tmp（原子写中间文件），它们和主文件一样可能含密钥，一律不入库
 config.json
-config.json.bad
+config.json.*
 
 # 运行日志（含本机绝对路径）
 *.log
