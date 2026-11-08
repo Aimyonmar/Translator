@@ -163,6 +163,15 @@ QLabel#stateValue {{
     color: {ACCENT};
 }}
 QLabel#hint {{ font-size: 11px; color: {TEXT_MUTED}; }}
+/* 写盘失败提示：行内警示条，不遮挡内容、不打断字幕 */
+QLabel#saveError {{
+    font-size: 12px;
+    color: {DANGER};
+    background: rgba(224, 90, 90, 0.12);
+    border: 1px solid rgba(224, 90, 90, 0.45);
+    border-radius: 6px;
+    padding: 6px 10px;
+}}
 
 /* ---------- 分组卡片 ---------- */
 QGroupBox {{

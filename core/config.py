@@ -188,9 +188,27 @@ class AppConfig:
         # 写盘闸门：只有真实应用入口用 load(interactive=True) 拿到的实例才允许落盘。
         # 脚本/测试/回放默认只读，save() 直接拒绝并打印调用点，从机制上堵住配置污染。
         self._interactive = False
+        # 写盘结果回调（面板注册）：成功 {"kind": "ok"}，失败带 kind/errors/detail
+        self._save_hook = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def set_save_hook(self, cb) -> None:
+        """注册写盘结果回调，供界面把「设置未保存」显式展示给用户。
+
+        非交互实例被闸门拒绝时不回调——那是脚本/测试的预期行为，只打日志。
+        """
+        self._save_hook = cb
+
+    def _emit_save(self, payload: Dict[str, Any]) -> None:
+        cb = getattr(self, "_save_hook", None)
+        if cb is None:
+            return
+        try:
+            cb(payload)
+        except Exception:
+            pass
 
     def save(self, reason: str = "") -> bool:
         """校验 → 备份 → 临时文件 → 原子替换；返回是否真的写了文件。
@@ -208,6 +226,7 @@ class AppConfig:
         if errs:
             for e in errs:
                 _warn("拒绝写盘：%s（原文件未改动）" % e)
+            self._emit_save({"kind": "validate", "errors": errs, "reason": reason})
             return False
         with _SAVE_LOCK:
             path = CONFIG_PATH
@@ -230,7 +249,11 @@ class AppConfig:
                 except Exception:
                     pass
                 _warn("写盘失败（%s: %s），原文件未改动" % (exc.__class__.__name__, exc))
+                self._emit_save({"kind": "io",
+                                 "detail": "%s: %s" % (exc.__class__.__name__, exc),
+                                 "reason": reason})
                 return False
+        self._emit_save({"kind": "ok", "reason": reason})
         return True
 
     # 数值字段的合法区间：(下限, 上限, 类型)。config.json 是用户可手改的边界，

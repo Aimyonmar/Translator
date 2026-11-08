@@ -65,6 +65,8 @@ class ControlPanel(QWidget):
     # 实时记录：原文上屏与译文上屏各来一次，按上屏顺序在面板里累积成转写稿
     sig_live_partial = Signal(int, str)
     sig_live_line = Signal(int, str, str)
+    # 写盘结果：save() 可能在后台线程触发，统一用信号投递回主线程再改控件
+    sig_save_state = Signal(object)
 
     def __init__(self, cfg, controller):
         super().__init__()
@@ -119,6 +121,11 @@ class ControlPanel(QWidget):
         self.sig_trs_fail.connect(self._on_trs_fail)
         self.sig_live_partial.connect(self._on_live_partial)
         self.sig_live_line.connect(self._on_live_line)
+        # 写盘失败提示：只在真实用户操作时出现，非交互闸门拦截只进日志
+        self.sig_save_state.connect(self._on_save_state, Qt.QueuedConnection)
+        hook = getattr(self.cfg, "set_save_hook", None)
+        if hook is not None:
+            hook(self._on_save_event)
         # 应用内快捷键作为全局热键失败时的后备（两者不会同时生效，避免一次按键记两条）
         self._fb_shortcut = QShortcut(QKeySequence(self._hotkey_text()), self)
         self._fb_shortcut.setContext(Qt.ApplicationShortcut)
@@ -250,6 +257,24 @@ class ControlPanel(QWidget):
         row.addWidget(self.btn_pause, 1)
         row.addWidget(self.btn_sub, 1)
         v.addLayout(row)
+
+        # 写盘失败提示条：不弹窗、不打断字幕，只在顶栏占一行；保存成功后自动收起。
+        # 文案同时说明「文件没改」与「界面显示值未保存」，避免用户误以为改动已生效。
+        self.save_bar = QWidget()
+        sb = QHBoxLayout(self.save_bar)
+        sb.setContentsMargins(0, 0, 0, 0)
+        sb.setSpacing(8)
+        self.lbl_save = QLabel("")
+        self.lbl_save.setObjectName("saveError")
+        self.lbl_save.setWordWrap(True)
+        self.btn_save_retry = QPushButton("重试保存")
+        self.btn_save_retry.setFixedHeight(26)
+        self.btn_save_retry.clicked.connect(lambda: self._save_cfg("重试保存"))
+        sb.addWidget(self.lbl_save, 1)
+        sb.addWidget(self.btn_save_retry)
+        self.save_bar.setVisible(False)
+        self._save_failed = False
+        v.addWidget(self.save_bar)
         return bar
 
     def _build_nav(self) -> QWidget:
@@ -1014,7 +1039,7 @@ class ControlPanel(QWidget):
         self.cfg.asr_device = self.cmb_dev.currentText()
         # 用户手动改了设备，就重新给 GPU 一次机会（比如刚装好 CUDA 运行库）
         self.cfg.gpu_ok = True
-        self.cfg.save()
+        self._save_cfg()
         self.ctrl.on_model_changed()
 
     # ------------------------------------------------------------ 模型缓存
@@ -1133,27 +1158,27 @@ class ControlPanel(QWidget):
 
     def _on_wordmap(self) -> None:
         self.cfg.word_map = self.txt_wordmap.text().strip()
-        self.cfg.save()
+        self._save_cfg()
 
     def _on_names(self) -> None:
         self.cfg.name_roster = self.txt_names.text().strip()
         self.cfg.enable_namefix = True
-        self.cfg.save()
+        self._save_cfg()
 
     def _on_hotwords(self, *_a) -> None:
         self.cfg.enable_hotwords = self.chk_hotwords.isChecked()
-        self.cfg.save()
+        self._save_cfg()
 
     def _on_denoise(self, *_a) -> None:
         self.cfg.enable_denoise = self.chk_denoise.isChecked()
         self.cfg.denoise_strength = float(self.sp_denoise.value())
-        self.cfg.save()
+        self._save_cfg()
         self.ctrl.on_denoise_changed()
 
     def _on_vocal(self, *_a) -> None:
         self.cfg.vocal_extract = self.chk_vocal.isChecked()
         self.cfg.vocal_strength = float(self.sp_vocal.value())
-        self.cfg.save()
+        self._save_cfg()
         self.ctrl.on_vocal_changed()
 
     def _on_context_toggle(self, *_a) -> None:
@@ -1165,7 +1190,7 @@ class ControlPanel(QWidget):
         self.cfg.context_window = int(self.sp_ctx.value())
         self.sp_ctx.setEnabled(self.chk_context.isChecked())
         self.chk_free.setEnabled(self.chk_context.isChecked())
-        self.cfg.save()
+        self._save_cfg()
 
     def _on_glossary_changed(self) -> None:
         # 逐字保存会很频繁：停手 600ms 再落盘
@@ -1173,7 +1198,7 @@ class ControlPanel(QWidget):
 
     def _on_glossary(self) -> None:
         self.cfg.context_glossary = self.txt_glossary.toPlainText().strip()
-        self.cfg.save()
+        self._save_cfg()
 
     def _on_health_click(self) -> None:
         self.btn_health.setEnabled(False)
@@ -1190,14 +1215,14 @@ class ControlPanel(QWidget):
     def _on_beam(self, *_a) -> None:
         self.cfg.beam_size = int(self.sp_beam.value())
         self.cfg.beam_auto = False   # 用户手动改过解码宽度，不再自动降档
-        self.cfg.save()
+        self._save_cfg()
         self.ctrl.on_beam_changed()
 
     def _on_trans_changed(self, *_a) -> None:
         idx = self.cmb_channel.currentIndex()
         self.cfg.channel = CHANNELS[idx] if 0 <= idx < len(CHANNELS) else "auto"
         self.cfg.target_lang = LANGS.get(self.cmb_lang.currentText(), "zh-Hans")
-        self.cfg.save()
+        self._save_cfg()
         self.ctrl.on_trans_changed()
 
     def _on_api_changed(self, *_a) -> None:
@@ -1209,25 +1234,25 @@ class ControlPanel(QWidget):
             self.cfg.custom_type = "deepl"
         self.cfg.custom_base = self.txt_base.text().strip()
         self.cfg.custom_model = self.txt_model.text().strip()
-        self.cfg.save()
+        self._save_cfg()
         self.ctrl.on_trans_changed()
 
     def _on_proxy(self) -> None:
         self.cfg.proxy = self.txt_proxy.text().strip()
-        self.cfg.save()
+        self._save_cfg()
         self.ctrl.on_trans_changed()
 
     def _on_sens(self, v: int) -> None:
         self.cfg.sensitivity = round(v / 100.0, 2)
         self.lbl_sens.setText(f"{self.cfg.sensitivity:.2f}")
         self.ctrl.on_vad_changed()
-        self.cfg.save()
+        self._save_cfg()
 
     def _on_vad(self, *_a) -> None:
         self.cfg.min_silence_ms = int(self.sp_silence.value())
         self.cfg.max_speech_ms = int(self.sp_max.value())
         self.ctrl.on_vad_changed()
-        self.cfg.save()
+        self._save_cfg()
 
     def _on_bg(self, v: int) -> None:
         self.cfg.opacity = round(v / 100.0, 2)
@@ -1432,7 +1457,7 @@ class ControlPanel(QWidget):
         if text != self._hotkey_text():
             self.cfg.feedback_hotkey = text
             try:
-                self.cfg.save()
+                self._save_cfg()
             except Exception:
                 pass
             self._log("标错热键改为：%s" % text)
@@ -1567,7 +1592,7 @@ class ControlPanel(QWidget):
     def _on_feedback_toggle(self, checked: bool) -> None:
         self.cfg.enable_feedback = bool(checked)
         try:
-            self.cfg.save()
+            self._save_cfg()
         except Exception:
             pass
         self._apply_hotkey()
@@ -1681,7 +1706,7 @@ class ControlPanel(QWidget):
             QMessageBox.warning(self, "导出失败", f"{type(exc).__name__}: {exc}")
             return
         self.cfg.export_dir = os.path.dirname(os.path.abspath(path))
-        self.cfg.save()
+        self._save_cfg()
         self.lbl_live_out.setText(f"已导出：{path}")
         self.lbl_live_out.setToolTip(path)
         self._log(f"已导出实时记录：{path}")
@@ -1694,7 +1719,7 @@ class ControlPanel(QWidget):
         if not path:
             return
         self.cfg.transcribe_dir = os.path.dirname(path)
-        self.cfg.save()
+        self._save_cfg()
         self._set_trs_source(path)
 
     def _set_trs_source(self, path: str) -> None:
@@ -1717,7 +1742,7 @@ class ControlPanel(QWidget):
         """转写选项写回配置：下次启动仍按上次勾选的状态跑。"""
         self.cfg.trs_translate = bool(self.chk_trs_translate.isChecked())
         self.cfg.trs_max_chars = int(self.spn_trs_chars.value())
-        self.cfg.save()
+        self._save_cfg()
 
     def _on_trs_start(self) -> None:
         if not self._trs_path:
@@ -1910,6 +1935,35 @@ class ControlPanel(QWidget):
 
     def _set_status(self, text: str) -> None:
         self.lbl_state.setText(text)
+
+    def _save_cfg(self, reason: str = "面板设置") -> bool:
+        """面板控件的保存统一入口：失败时由 save 回调弹出顶栏提示。"""
+        return bool(self.cfg.save(reason=reason))
+
+    def _on_save_event(self, ev) -> None:
+        # save() 可能来自采集/翻译线程：只投递信号，回主线程再改控件
+        self.sig_save_state.emit(ev)
+
+    def _on_save_state(self, ev) -> None:
+        """写盘结果上屏：成功收起提示条，失败写明键名/错误并标注显示值未保存。"""
+        ev = ev or {}
+        kind = ev.get("kind")
+        if kind == "ok":
+            self._save_failed = False
+            self.lbl_save.clear()
+            self.save_bar.setVisible(False)
+            return
+        if kind == "validate":
+            detail = "；".join(ev.get("errors") or []) or "配置校验未通过"
+        else:
+            detail = ev.get("detail") or "未知错误"
+        text = ("设置未保存：%s。config.json 未改动，当前显示值未保存。"
+                "可修正后点「重试保存」。" % detail)
+        if ev.get("reason"):
+            text += "（来源：%s）" % ev["reason"]
+        self._save_failed = True
+        self.lbl_save.setText(text)
+        self.save_bar.setVisible(True)
 
     def _set_level(self, v: float) -> None:
         self.bar.setValue(int(max(0.0, min(1.0, v)) * 100))
