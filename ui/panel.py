@@ -235,6 +235,7 @@ class ControlPanel(QWidget):
             "本场实时统计（只读，不参与翻译决策）：\n"
             "上屏 = 已显示的句子数；有译文 = 其中译文非空；\n"
             "失败 = 译文为空（原文兜底）；已标错 = 写入 feedback.jsonl 的条数；\n"
+            "备胎 = 主备赛跑中备通道胜出并救回译文的次数（关闭 hedge 时恒为 0）。\n"
             "与 eval 报告的 finals / with_tgt 同口径，关闭标错后前四项照常统计。")
         self._refresh_counts()
         self.lbl_state = QLabel("未启动")
@@ -1607,9 +1608,9 @@ class ControlPanel(QWidget):
                 c = pipe.counts()
             except Exception:
                 c = {}
-        text = "上屏 %d · 有译文 %d · 失败 %d · 标错 %d" % (
+        text = "上屏 %d · 有译文 %d · 失败 %d · 标错 %d · 备胎 %d" % (
             int(c.get("final", 0)), int(c.get("tgt", 0)),
-            int(c.get("fail", 0)), int(self._fb_count))
+            int(c.get("fail", 0)), int(self._fb_count), int(c.get("hedge", 0)))
         if self.lbl_counts.text() != text:
             self.lbl_counts.setText(text)
 

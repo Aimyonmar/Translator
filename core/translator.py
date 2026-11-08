@@ -350,6 +350,8 @@ class Translator:
         if not text:
             return None
         self._tls.channel = ""
+        # 本句的主备赛跑结果（是否备胎救回、晚到多少、谁胜出），没走主备时为 None
+        self._tls.hedge = None
         # 上下文块在本地拼装（<0.1ms）：只有能接受 system prompt 的 custom 通道用得上
         ctx_block = ""
         if context and self.cfg is not None and getattr(self.cfg, "enable_context", True) \
@@ -591,10 +593,17 @@ class Translator:
         """
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
+        # 完成时刻（相对 t0）按通道记：用来算「备胎比主通道晚多久到」
+        t0 = time.perf_counter()
+        done_at: dict = {}
+
         def work(ch):
             try:
-                return self._timed_fire(ch, text, src, timeout=timeout, gid=gid)
+                out = self._timed_fire(ch, text, src, timeout=timeout, gid=gid)
+                done_at[ch] = time.perf_counter() - t0
+                return out
             except Exception:
+                done_at[ch] = time.perf_counter() - t0
                 # 与串行路径一致：确认不通就本次会话不再重试，否则主备模式会每句都
                 # 先撞一次同一个坏通道
                 with self.lock:
@@ -604,7 +613,6 @@ class Translator:
         ex = ThreadPoolExecutor(max_workers=2)
         futs = {ex.submit(work, chs[0]): chs[0]}
         fired = 1
-        t0 = time.perf_counter()
         if delay_ms <= 0 and len(chs) > 1:
             futs[ex.submit(work, chs[1])] = chs[1]
             fired = 2
@@ -638,6 +646,26 @@ class Translator:
                     futs[ex.submit(work, chs[1])] = chs[1]
                     fired += 1
         ex.shutdown(wait=False)
+        # 上报口径：rescued=胜出的是备胎；late_ms=备胎完成比主通道完成晚多少（都拿到时刻才算，
+        # 主通道超时/失败时没有参照，记 None）；winner=最终胜出通道。
+        info = None
+        if best is not None:
+            winner = best[1]
+            primary = chs[0]
+            late = None
+            if winner != primary:
+                pw, bw = done_at.get(primary), done_at.get(winner)
+                if pw is not None and bw is not None:
+                    late = max(0.0, (bw - pw) * 1000.0)
+            info = {"primary": primary, "backup": chs[1], "winner": winner,
+                    "rescued": winner != primary, "backup_fired": fired > 1,
+                    "late_ms": None if late is None else round(late, 1)}
+            if info["rescued"]:
+                self._say("备胎救回：%s 晚 %s（主通道 %s%s）"
+                          % (winner,
+                             "%.0fms" % late if late is not None else "未返回",
+                             primary, "" if late is not None else "，无参照"))
+        self._tls.hedge = info
         return best
 
     def start_keepalive(self) -> None:
@@ -794,6 +822,13 @@ class Translator:
     def last_channel(self) -> str:
         """当前线程最近一次 translate 实际用到（或拿到响应）的通道，仅诊断用。"""
         return getattr(self._tls, "channel", "") or ""
+
+    def last_hedge(self) -> Optional[dict]:
+        """当前线程这一句的主备结果：是否备胎救回、晚到毫秒、胜出通道。
+
+        没走主备（单通道、关闭 hedge、或有上下文前缀）时为 None；只读，不影响翻译。
+        """
+        return getattr(self._tls, "hedge", None)
 
     # ---------------------------------------------------------- 代理
     @staticmethod

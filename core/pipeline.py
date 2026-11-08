@@ -78,7 +78,7 @@ class Pipeline:
         # 只做只读统计，不参与任何翻译/识别决策；关掉标错也照常记（它统计的是链路本身）。
         # 需要锁只是因为翻译线程有 2 条，自增本身是纳秒级，不进任何阻塞路径。
         self._count_lock = threading.Lock()
-        self._counts = {"final": 0, "tgt": 0, "fail": 0}
+        self._counts = {"final": 0, "tgt": 0, "fail": 0, "hedge": 0}
 
     # ------------------------------------------------------------ 控制
     def start(self) -> None:
@@ -105,7 +105,7 @@ class Pipeline:
         self._session_t0 = time.time()
         self.recent.clear()
         with self._count_lock:
-            self._counts = {"final": 0, "tgt": 0, "fail": 0}
+            self._counts = {"final": 0, "tgt": 0, "fail": 0, "hedge": 0}
         self.state = "loading"
         self.on_status("正在准备模型…")
         threading.Thread(target=self._boot, args=(stop_evt,), daemon=True).start()
@@ -719,6 +719,8 @@ class Pipeline:
             # 通道在 translate 返回后立刻取：last_channel() 是线程内的，
             # 两个翻译线程并发时，只有这里取才是这一句自己的通道
             meta["channel"] = self.translator.last_channel()
+            # 主备赛跑结果（是否备胎救回/晚到毫秒/胜出通道）：线程内取值，只做上报
+            meta["hedge"] = self.translator.last_hedge()
             if stop_evt.is_set():      # 停止后别再往新一轮的状态里写旧序号
                 break
             with self._seq_lock:
@@ -780,10 +782,14 @@ class Pipeline:
                 except Exception:
                     pass
             # 计数先于回调：面板在 on_result 里就会刷新顶栏，先记账才不会读到上一句的数字。
-            # 口径与 bench 一致（每次 on_result 记一条，译文为空记 fail）。
+            # 口径与 bench 一致（每次 on_result 记一条，译文为空记 fail）；hedge 只在
+            # 备胎胜出且译文可用时记一次，关闭 hedge 时永远是 0。
+            hedge = meta.get("hedge") or {}
             with self._count_lock:
                 self._counts["final"] += 1
                 self._counts["tgt" if out else "fail"] += 1
+                if out and hedge.get("rescued"):
+                    self._counts["hedge"] += 1
             try:
                 # 翻译失败也要把原文顶上去，别让字幕一片空白
                 self.on_result(seq, disp_text, out)
