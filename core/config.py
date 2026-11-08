@@ -78,6 +78,12 @@ class AppConfig:
     # 默认关闭。
     enable_translate_glossary: bool = False
     translate_glossary: str = ""
+    # LLM 质量通道（可选）：provider = deepseek | dashscope（均为 OpenAI 兼容接口）。
+    # 没填 Key 或关掉开关时，该通道不进入候选列表，现有链路完全不受影响。默认关闭。
+    enable_llm_quality: bool = False
+    llm_provider: str = ""
+    llm_key: str = ""
+    llm_model: str = ""
     # 翻译
     channel: str = "auto"
     target_lang: str = "zh-Hans"
@@ -194,6 +200,7 @@ class AppConfig:
         "custom_type", "custom_key", "custom_base", "custom_model", "caiyun_token",
         "last_channel", "word_map", "name_roster", "proxy", "context_glossary",
         "transcribe_dir", "export_dir", "translate_glossary",
+        "llm_provider", "llm_key", "llm_model",
     )
 
     def _sanitize(self) -> None:

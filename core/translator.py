@@ -2,7 +2,7 @@
 """翻译模块：免费在线通道 + 可选自定义 API + 代理支持。
 
 免费通道（无需 Key）：Edge·必应 / Google / DeepL网页 / MyMemory，自动探测可用的那个。
-自定义 API（可选，质量最好）：DeepL 免费版 Key，或任意 OpenAI 兼容接口（DeepSeek、通义、豆包、本地 Ollama…）。
+自定义 API（可选，质量最好）：DeepL 免费版 Key，或任意 OpenAI 兼容接口（DeepSeek、通义、豆包…）。
 代理：国内网络可填 HTTP 代理（如 http://127.0.0.1:7890）解锁 Google / Edge，程序也会自动探测本机代理端口。
 """
 from __future__ import annotations
@@ -28,7 +28,8 @@ from .zh_polish import zh_polish
 CHANNELS = ["auto", "custom", "tencent", "caiyun", "mymemory", "edge", "google", "deepl"]
 CHANNEL_NAMES = {"auto": "自动", "custom": "自定义 API", "tencent": "腾讯翻译君",
                  "caiyun": "彩云小译", "edge": "Edge·必应",
-                 "google": "Google", "deepl": "DeepL 网页", "mymemory": "MyMemory"}
+                 "google": "Google", "deepl": "DeepL 网页", "mymemory": "MyMemory",
+                 "llm": "LLM 质量通道"}
 
 # 国内实测（2026-10）：腾讯 217ms / 彩云 715ms / MyMemory 831ms，
 # 且口语准确率 彩云 > 腾讯 > MyMemory。默认把最快、也够用的腾讯排前面。
@@ -99,6 +100,20 @@ class Translator:
         # requests 的 merge_setting 会把值为 None 的键从 session.proxies 里删掉，
         # 所以传它等于「本次请求不走代理」。
         self._no_proxy = {"http": None, "https": None}
+        # LLM 质量通道（可选）：开关关着、provider 不认识或没填 Key 时 available=False，
+        # 此时 "llm" 根本不会进入 _order()，现有链路的行为与延迟一字不变。
+        self._llm = None
+        try:
+            from .llm_tr import LLMTranslator
+            self._llm = LLMTranslator(cfg)
+        except Exception:
+            self._llm = None
+
+    def _llm_ready(self) -> bool:
+        try:
+            return bool(self._llm and self._llm.available)
+        except Exception:
+            return False
 
     def _say(self, msg: str) -> None:
         if self.log_cb:
@@ -281,15 +296,22 @@ class Translator:
             raise RuntimeError(f"caiyun rc={data.get('rc')}")
         return html.unescape((data.get("target") or [""])[0]).strip()
 
+    def _tr_llm(self, text: str, src: str = "ja", context: str = "") -> Optional[str]:
+        """LLM 质量通道：不可用或失败都返回 None，由调用方回落免费通道。"""
+        if not self._llm_ready():
+            return None
+        return self._llm.translate(text, context=context, src=src)
+
     def _dispatch(self, ch: str, text: str, src: str = "ja", timeout: float = 4.0,
                   context: str = "") -> Optional[str]:
-        fn = {"custom": self._tr_custom, "tencent": self._tr_tencent, "caiyun": self._tr_caiyun,
+        fn = {"custom": self._tr_custom, "llm": self._tr_llm,
+              "tencent": self._tr_tencent, "caiyun": self._tr_caiyun,
               "edge": self._tr_edge, "google": self._tr_google,
               "deepl": self._tr_deepl, "mymemory": self._tr_mymemory}.get(ch)
         if fn is None:
             return None
-        if ch == "custom":
-            # 用户自己配的通道，愿意多等，不受实时预算限制
+        if ch in ("custom", "llm"):
+            # 用户自己配的通道 / LLM 质量通道：能接受上下文，愿意多等，不受实时预算限制
             return fn(text, src, context)
         # 免费通道没有上下文入口：传了也不用，避免把前文拼进请求
         return fn(text, src, timeout)
@@ -301,12 +323,18 @@ class Translator:
         # 让它一直排在最前，用户就永远用不上快 4 倍的腾讯。
         base = list(COLLOQUIAL_ORDER if (text and is_colloquial(text)) else FREE_ORDER)
         free = [c for c in base if c not in self._dead] or list(base)
-        if self._custom_ready():
-            return ["custom"] + free
         ch = self.channel
+        # 用户在面板里显式选了某个通道时，尊重选择，不把 LLM 插到它前面
         if ch in CHANNELS and ch != "auto":
+            if ch == "custom" and self._custom_ready():
+                return ["custom"] + free
             return [ch] + [c for c in free if c != ch]
-        return free
+        head = []
+        if self._llm_ready():
+            head.append("llm")
+        if self._custom_ready():
+            head.append("custom")
+        return head + free
 
     # ---------------------------------------------------------- 对外
     def translate(self, text: str, context=()) -> Optional[str]:
@@ -321,7 +349,7 @@ class Translator:
         # 上下文块在本地拼装（<0.1ms）：只有能接受 system prompt 的 custom 通道用得上
         ctx_block = ""
         if context and self.cfg is not None and getattr(self.cfg, "enable_context", True) \
-                and self._custom_ready():
+                and (self._custom_ready() or self._llm_ready()):
             try:
                 ctx_block = format_context(
                     context,
@@ -390,10 +418,10 @@ class Translator:
         gid = self._next_gid()      # A/B：同一句的线路记录共用这个号
         # 实时字幕有总预算：免费通道挨个试过去最坏能拖到二三十秒（实测 21 秒），
         # 字幕就彻底跟不上说话了。超预算立刻放弃译文、只显示原文。
-        deadline = time.time() + (25.0 if custom else self.BUDGET)
+        deadline = time.time() + (25.0 if (custom or self._llm_ready()) else self.BUDGET)
         switched = False
-        # A/B：只对前两条免费通道做双发/主备；custom 和带免费语境前缀的路径不参与
-        hedge_chs = [c for c in order if c != "custom"][:2]
+        # A/B：只对前两条免费通道做双发/主备；custom / llm 和带免费语境前缀的路径不参与
+        hedge_chs = [c for c in order if c not in ("custom", "llm")][:2]
         use_hedge = self.hedge_mode != "single" and len(hedge_chs) == 2 and not free_ctx
         # 双发的位置必须是「第一条免费通道」，不能是 i==0：
         # 配了 custom 时 order 的第一项是 custom，那样会直接把 custom 顶掉。
@@ -404,7 +432,7 @@ class Translator:
                 break
             # 免费通道没有上下文参数：把极短前缀用换行拼在待翻译文本前面，
             # 再靠换行把当前句那段切出来（custom 通道走 system 上下文，不拼前缀）
-            use_free = bool(free_ctx) and ch != "custom"
+            use_free = bool(free_ctx) and ch not in ("custom", "llm")
             send = (free_ctx + "\n" + pro) if use_free else pro
             if i == hedge_i:
                 pick = self._race(
@@ -419,7 +447,7 @@ class Translator:
                     # 只剩多少时间就只给多少超时：只在循环开头检查预算是拦不住的，
                     # 单次请求（实测 mymemory 4s + edge 鉴权 3s = 8 秒）会把预算整个冲破
                     out = self._timed_fire(ch, send, src, timeout=min(4.0, left),
-                                           context=ctx_block if ch == "custom" else "",
+                                           context=ctx_block if ch in ("custom", "llm") else "",
                                            gid=gid)
                 except Exception as exc:
                     last_err = exc
@@ -483,7 +511,10 @@ class Translator:
                     self._cache.popitem(last=False)
                 if self._active != ch:
                     self._active = ch
-                    self._remember(ch)
+                    # "llm" 不在 CHANNELS 里，写进 last_channel 会让下次开机
+                    # 出现一个面板选不中的值；它的可用性完全取决于 Key，不该被记住
+                    if ch != "llm":
+                        self._remember(ch)
                     switched = True
             if switched:
                 self._say(f"翻译通道：{CHANNEL_NAMES.get(ch, ch)}")
