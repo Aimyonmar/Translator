@@ -371,54 +371,228 @@ class AppController:
         cancel = self._trs_cancel
 
         def work():
-            asr = self.pipeline.asr
             try:
-                self.panel.sig_trs_status.emit("正在加载模型…")
-                asr.load(on_progress=self.panel.sig_trs_status.emit)
-                self.status(f"开始转写：{os.path.basename(path)}")
-                namefix = bool(self.cfg.enable_namefix)
-                t0 = time.perf_counter()
-                segments, total = transcribe_media(
-                    asr, path,
-                    # "" / auto 表示让 Whisper 自己判语种；kotoba 等日语专用档由
-                    # asr.resolve_language() 强制 ja（不能在这里直接传 None 绕开）
-                    language=asr.resolve_language(self.cfg.source_lang),
-                    word_map=self.cfg.word_map if namefix else "",
-                    roster=self.cfg.name_roster if namefix else "",
-                    # 离线多花一点时间换字词时间码：工程 JSON 与重新断句都要用
-                    word_timestamps=True,
-                    on_progress=self.panel.sig_trs_progress.emit,
-                    should_stop=cancel.is_set,
-                )
-                t_asr = time.perf_counter() - t0
-                if max_chars and segments:
-                    n0 = len(segments)
-                    segments = resplit(segments, max_chars)
-                    self.panel.sig_trs_status.emit(
-                        f"已重新断句：{n0} → {len(segments)} 句（≤{max_chars} 字）")
-                if translate and segments and not cancel.is_set():
-                    def on_tr(i: int, n: int) -> None:
-                        self.panel.sig_trs_progress.emit(int(i / max(1, n) * 100))
-                        if i % 5 == 0 or i == n:
-                            self.panel.sig_trs_status.emit(f"正在翻译 {i}/{n} 句…")
-
-                    t1 = time.perf_counter()
-                    ok = translate_segments(
-                        self.pipeline.translator, segments,
-                        roster=self.cfg.name_roster if namefix else "",
-                        builtin_titles=bool(getattr(self.cfg, "builtin_titles", True)),
-                        on_progress=on_tr,
-                        should_stop=cancel.is_set,
-                    )
-                    self.panel.sig_trs_status.emit(
-                        f"翻译完成：{ok}/{len(segments)} 句，用时 {time.perf_counter() - t1:.1f}s")
-                self.panel.sig_trs_done.emit((segments, total, cancel.is_set()))
-                if cancel.is_set():
-                    self.status(f"已取消转写（保留 {len(segments)} 句）")
-                else:
-                    self.status(f"转写完成：{len(segments)} 句，识别耗时 {t_asr:.1f}s")
+                self._transcribe_job(path, translate, max_chars, cancel)
             except Exception as exc:
                 self.panel.sig_trs_fail.emit(f"转写失败：{type(exc).__name__}: {exc}")
+            finally:
+                self._trs_busy = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _transcribe_job(self, path: str, translate: bool, max_chars: int,
+                        cancel: threading.Event) -> None:
+        """转写一份本地音视频：加载模型 → ASR → 可选翻译 → 发 sig_trs_done。
+
+        本地文件与 URL 下载后的音频共用这一段；取消靠 cancel.is_set。
+        """
+        asr = self.pipeline.asr
+        self.panel.sig_trs_status.emit("正在加载模型…")
+        asr.load(on_progress=self.panel.sig_trs_status.emit)
+        # 显式降级：kotoba 原件的 alignment 层号越界，开字词时间码会直接崩进程。
+        # 有校验通过的修复副本时 words_safe 会放开；副本缺失/损坏则回到降级。
+        from core.asr import words_safe
+        if not words_safe(asr.model_size, getattr(asr, "loaded_ref", "")):
+            msg = (f"已降级：{asr.model_size} 不支持字词时间码"
+                   "（alignment 层号超出解码器层数，ctranslate2 会直接崩进程），"
+                   "本次只出句级时间轴；文本与导出不受影响。")
+            self.panel.sig_trs_status.emit(msg)
+            # 再进日志：完成时状态标签会被「转写完成」覆盖，日志里要留这条降级说明
+            self.status(msg)
+        self.status(f"开始转写：{os.path.basename(path)}")
+        namefix = bool(self.cfg.enable_namefix)
+        t0 = time.perf_counter()
+        segments, total = transcribe_media(
+            asr, path,
+            # "" / auto 表示让 Whisper 自己判语种；kotoba 等日语专用档由
+            # asr.resolve_language() 强制 ja（不能在这里直接传 None 绕开）
+            language=asr.resolve_language(self.cfg.source_lang),
+            word_map=self.cfg.word_map if namefix else "",
+            roster=self.cfg.name_roster if namefix else "",
+            # 离线多花一点时间换字词时间码：工程 JSON 与重新断句都要用
+            word_timestamps=True,
+            on_progress=self.panel.sig_trs_progress.emit,
+            should_stop=cancel.is_set,
+        )
+        t_asr = time.perf_counter() - t0
+        if max_chars and segments:
+            n0 = len(segments)
+            segments = resplit(segments, max_chars)
+            self.panel.sig_trs_status.emit(
+                f"已重新断句：{n0} → {len(segments)} 句（≤{max_chars} 字）")
+        if translate and segments and not cancel.is_set():
+            def on_tr(i: int, n: int) -> None:
+                self.panel.sig_trs_progress.emit(int(i / max(1, n) * 100))
+                if i % 5 == 0 or i == n:
+                    self.panel.sig_trs_status.emit(f"正在翻译 {i}/{n} 句…")
+
+            t1 = time.perf_counter()
+            ok = translate_segments(
+                self.pipeline.translator, segments,
+                roster=self.cfg.name_roster if namefix else "",
+                builtin_titles=bool(getattr(self.cfg, "builtin_titles", True)),
+                on_progress=on_tr,
+                should_stop=cancel.is_set,
+            )
+            self.panel.sig_trs_status.emit(
+                f"翻译完成：{ok}/{len(segments)} 句，用时 {time.perf_counter() - t1:.1f}s")
+        self.panel.sig_trs_done.emit((segments, total, cancel.is_set()))
+        if cancel.is_set():
+            self.status(f"已取消转写（保留 {len(segments)} 句）")
+        else:
+            self.status(f"转写完成：{len(segments)} 句，识别耗时 {t_asr:.1f}s")
+
+    # ------------------------------------------------------------ 单视频 URL
+    def url_probe(self, url: str) -> None:
+        """只读探测：标题、时长、字幕语种；结果用非阻塞信息框呈现。"""
+        url = (url or "").strip()
+        if not url:
+            self.panel.sig_trs_fail.emit("先粘贴一个视频链接。")
+            return
+
+        def work():
+            from core import url_source as us
+            try:
+                info = us.probe(url, proxy=self.cfg.proxy)
+                page = info["webpage_url"] or url
+                lines = [info["title"] or "(无标题)",
+                         "时长 %d 秒" % int(info["duration"]),
+                         "站点：%s" % (page.split("//")[-1].split("/")[0])]
+                if info.get("uploader"):
+                    lines.append("UP 主：%s" % info["uploader"])
+                subs = info["subtitles"]
+                autos = info["automatic"]
+                if subs:
+                    lines.append("人工字幕：" + "、".join(
+                        "%s(%s)" % (s["lang"], "/".join(s["formats"]) or "-") for s in subs))
+                if autos:
+                    lines.append("自动字幕：" + "、".join(
+                        "%s(%s)" % (s["lang"], "/".join(s["formats"]) or "-") for s in autos))
+                if not subs and not autos:
+                    lines.append("未读到可用字幕：可能需要登录，或该视频没有字幕。")
+                self.panel.sig_url_info.emit("\n".join(lines))
+            except us.UrlError as exc:
+                text = exc.message + (("\n\n" + exc.hint) if exc.hint else "")
+                self.panel.sig_url_info.emit(text)
+            except Exception as exc:
+                self.panel.sig_url_info.emit("探测失败：%s: %s" % (type(exc).__name__, exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def url_transcribe_start(self, url: str, translate: bool = False,
+                             max_chars: int = 0) -> None:
+        """下载单个视频的音频到临时目录，转写完自动删除。"""
+        url = (url or "").strip()
+        if not url:
+            self.panel.sig_trs_fail.emit("先粘贴一个视频链接。")
+            return
+        if self._trs_busy:
+            return
+        if self.pipeline.state in ("running", "paused", "loading"):
+            self.panel.sig_trs_fail.emit("实时字幕正在运行，先停止翻译再转写。")
+            return
+        self._trs_busy = True
+        self._trs_cancel = threading.Event()
+        cancel = self._trs_cancel
+        self.panel.sig_trs_status.emit("正在解析链接…")
+
+        def work():
+            import shutil
+            import tempfile
+            from core import url_source as us
+            rt = os.path.join(os.path.dirname(__file__), ".runtime")
+            os.makedirs(rt, exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix="vttr_url_", dir=rt)
+            job_started = False
+            try:
+                if not us.have_ytdlp():
+                    raise us.UrlError("missing", "缺少可选依赖 yt-dlp", us.INSTALL_HINT)
+
+                last = {"p": -10}
+
+                def prog(pct: int, text: str) -> None:
+                    if cancel.is_set():
+                        raise us.Cancelled()
+                    self.panel.sig_trs_progress.emit(pct)
+                    if pct - last["p"] >= 10 or pct >= 100:
+                        last["p"] = pct
+                        self.panel.sig_trs_status.emit("下载音频 %d%%" % pct)
+
+                path, info = us.download_audio(
+                    url, tmp, proxy=self.cfg.proxy,
+                    on_progress=prog, should_stop=cancel.is_set)
+                title = (info.get("title") or info.get("id") or "video").strip()
+                # 导出目录固定到「文档」，音频稍后删除也能继续导出结果
+                docs = os.path.join(os.path.expanduser("~"), "Documents")
+                safe = "".join(c for c in title if c not in '\\/:*?"<>|').strip() or "video"
+                self.panel.sig_trs_source.emit(os.path.join(docs, safe + ".mp3"))
+                self.panel.sig_trs_status.emit(
+                    "音频下载完成（%d 秒），开始转写…" % int(info.get("duration") or 0))
+                job_started = True
+                self._transcribe_job(path, translate, max_chars, cancel)
+            except us.UrlError as exc:
+                if exc.kind == "cancel":
+                    self.panel.sig_trs_done.emit(([], 0.0, True))
+                else:
+                    self.panel.sig_trs_fail.emit(
+                        exc.message + (("\n" + exc.hint) if exc.hint else ""))
+            except us.Cancelled:
+                self.panel.sig_trs_done.emit(([], 0.0, True))
+            except Exception as exc:
+                self.panel.sig_trs_fail.emit("转写失败：%s: %s" % (type(exc).__name__, exc))
+            finally:
+                try:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                except Exception:
+                    pass
+                self._trs_busy = False
+                if cancel.is_set() and not job_started:
+                    self.panel.sig_trs_status.emit("已取消，临时文件已清理。")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def url_subs_start(self, url: str) -> None:
+        """直接取平台字幕生成文本/SRT（不做 ASR），只处理单视频。"""
+        url = (url or "").strip()
+        if not url:
+            self.panel.sig_trs_fail.emit("先粘贴一个视频链接。")
+            return
+        if self._trs_busy:
+            return
+        if self.pipeline.state in ("running", "paused", "loading"):
+            self.panel.sig_trs_fail.emit("实时字幕正在运行，先停止翻译再读字幕。")
+            return
+        self._trs_busy = True
+        self.panel.sig_trs_status.emit("正在读取字幕…")
+
+        def work():
+            from core.transcribe import Cue
+            from core import url_source as us
+            try:
+                if not us.have_ytdlp():
+                    raise us.UrlError("missing", "缺少可选依赖 yt-dlp", us.INSTALL_HINT)
+                folder = os.path.join(os.path.dirname(__file__), ".runtime", "url_subs")
+                files = us.download_subtitles(url, folder, proxy=self.cfg.proxy)
+                path = files[0]
+                raw = us.read_srt(path)
+                if not raw:
+                    raise us.UrlError("subs", "字幕文件为空或格式无法解析",
+                                      "可改用「下载并转写」走语音识别。")
+                # 面板与导出统一按 Cue 取值（_on_trs_done 读 .start/.end/.text）
+                segs = [Cue(a, b, t) for a, b, t in raw]
+                total = segs[-1].end
+                docs = os.path.join(os.path.expanduser("~"), "Documents")
+                stem = os.path.splitext(os.path.basename(path))[0]
+                self.panel.sig_trs_source.emit(os.path.join(docs, stem + ".srt"))
+                self.panel.sig_trs_status.emit(
+                    "已读取平台字幕 %d 条（非 ASR，可能有断句差异）" % len(segs))
+                self.panel.sig_trs_done.emit((segs, total, False))
+            except us.UrlError as exc:
+                self.panel.sig_trs_fail.emit(
+                    exc.message + (("\n" + exc.hint) if exc.hint else ""))
+            except Exception as exc:
+                self.panel.sig_trs_fail.emit("读取字幕失败：%s: %s"
+                                             % (type(exc).__name__, exc))
             finally:
                 self._trs_busy = False
 

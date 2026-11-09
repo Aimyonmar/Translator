@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .asr import _batch_supported
+from .asr import _batch_supported, words_safe
 
 SAMPLE_RATE = 16000
 
@@ -425,7 +425,9 @@ def transcribe_media(asr, path: str, language: Optional[str] = "ja",
 
     复用已经加载好的实时模型（asr.model），不另起一份 —— 两份模型同时驻留显存
     正是「与实时字幕互斥」要避免的情况。调用方负责保证模型已 load。
-    `word_timestamps=True` 时每句额外带上字词时间码（供工程 JSON 与重新断句用）。
+    `word_timestamps=True` 时每句额外带上字词时间码（供工程 JSON 与重新断句用）；
+    对 words_safe() 判为不兼容的模型（kotoba 等蒸馏档）自动关闭，否则 ctranslate2
+    的 align 会越界直接崩进程，识别文本本身不受影响。
     """
     if asr.model is None:
         raise RuntimeError("模型尚未加载")
@@ -441,7 +443,9 @@ def transcribe_media(asr, path: str, language: Optional[str] = "ja",
     )
     if _batch_supported() and getattr(asr, "batch_size", 1) > 1:
         kwargs["batch_size"] = asr.batch_size
-    want_words = bool(word_timestamps) and _words_supported(asr.model)
+    want_words = (bool(word_timestamps) and _words_supported(asr.model)
+                  and words_safe(getattr(asr, "model_size", ""),
+                                 getattr(asr, "loaded_ref", "")))
     if want_words:
         kwargs["word_timestamps"] = True
 
