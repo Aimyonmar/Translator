@@ -62,6 +62,9 @@ class ControlPanel(QWidget):
     sig_trs_status = Signal(str)
     sig_trs_done = Signal(object)       # (句段列表, 总时长秒, 是否被取消)
     sig_trs_fail = Signal(str)
+    # URL 入口：探测结果走信息框；转写源换成「文档/标题.mp3」保证临时音频删了也能导出
+    sig_url_info = Signal(str)
+    sig_trs_source = Signal(str)
     # 实时记录：原文上屏与译文上屏各来一次，按上屏顺序在面板里累积成转写稿
     sig_live_partial = Signal(int, str)
     sig_live_line = Signal(int, str, str)
@@ -119,6 +122,8 @@ class ControlPanel(QWidget):
         self.sig_trs_status.connect(self._on_trs_status)
         self.sig_trs_done.connect(self._on_trs_done)
         self.sig_trs_fail.connect(self._on_trs_fail)
+        self.sig_url_info.connect(self._on_url_info)
+        self.sig_trs_source.connect(self._set_trs_source)
         self.sig_live_partial.connect(self._on_live_partial)
         self.sig_live_line.connect(self._on_live_line)
         # 写盘失败提示：只在真实用户操作时出现，非交互闸门拦截只进日志
@@ -821,6 +826,28 @@ class ControlPanel(QWidget):
         self.lbl_trs_out = QLabel("导出目录：与源文件相同")
         self.lbl_trs_out.setObjectName("hint")
         f.addRow("", self.lbl_trs_out)
+        # URL 入口：只处理单个视频，音频进临时目录、转写完即删；
+        # 需要登录才有的字幕/码率只用用户自备 cookies，不做任何绕过。
+        self.txt_url = QLineEdit()
+        self.txt_url.setPlaceholderText("视频链接（B 站或 yt-dlp 支持的站点，单视频）")
+        self.btn_url_probe = QPushButton("探测")
+        self.btn_url_go = QPushButton("下载并转写")
+        self.btn_url_subs = QPushButton("取字幕")
+        self.btn_url_probe.clicked.connect(self._on_url_probe)
+        self.btn_url_go.clicked.connect(self._on_url_go)
+        self.btn_url_subs.clicked.connect(self._on_url_subs)
+        row_url = QHBoxLayout()
+        row_url.addWidget(self.txt_url, 1)
+        row_url.addWidget(self.btn_url_probe)
+        row_url.addWidget(self.btn_url_go)
+        row_url.addWidget(self.btn_url_subs)
+        f.addRow("链接", row_url)
+        lbl_url_hint = QLabel(
+            "需要登录才能取的字幕或更高码率：把浏览器 cookies 导出到 .runtime/cookies.txt 再试。\n"
+            "只取音频流（bestaudio），不下载付费/大会员内容，不绕过 DRM 或登录墙。")
+        lbl_url_hint.setObjectName("hint")
+        lbl_url_hint.setWordWrap(True)
+        f.addRow("", lbl_url_hint)
         root.addWidget(box_src)
 
         box_run = QGroupBox("转写")
@@ -1836,6 +1863,65 @@ class ControlPanel(QWidget):
     def _on_trs_cancel(self) -> None:
         self.ctrl.transcribe_cancel()
 
+    # ------------------------------------------------------------ URL 入口
+    def _on_url_probe(self) -> None:
+        url = self.txt_url.text().strip()
+        if not url:
+            QMessageBox.information(self, "视频链接", "先粘贴一个视频链接。")
+            return
+        self.lbl_trs_state.setText("正在探测链接…")
+        self.ctrl.url_probe(url)
+
+    def _on_url_info(self, text: str) -> None:
+        if text:
+            self.lbl_trs_state.setText(text.splitlines()[0])
+        QMessageBox.information(self, "链接探测", text)
+
+    def _on_url_go(self) -> None:
+        url = self.txt_url.text().strip()
+        if not url:
+            QMessageBox.information(self, "视频链接", "先粘贴一个视频链接。")
+            return
+        if self._running:
+            QMessageBox.information(
+                self, "下载并转写",
+                "实时字幕正在运行。两者共用同一份识别模型，"
+                "先点顶部「停止翻译」，再回来转写。")
+            return
+        self._trs_prepare_job("url")
+        self.lbl_trs_state.setText("正在解析链接…")
+        self.ctrl.url_transcribe_start(
+            url,
+            translate=bool(self.chk_trs_translate.isChecked()),
+            max_chars=int(self.spn_trs_chars.value()),
+        )
+
+    def _on_url_subs(self) -> None:
+        url = self.txt_url.text().strip()
+        if not url:
+            QMessageBox.information(self, "视频链接", "先粘贴一个视频链接。")
+            return
+        if self._running:
+            QMessageBox.information(
+                self, "取字幕", "实时字幕正在运行，先点顶部「停止翻译」。")
+            return
+        self._trs_prepare_job("subs")
+        self.lbl_trs_state.setText("正在读取字幕…")
+        self.ctrl.url_subs_start(url)
+
+    def _trs_prepare_job(self, kind: str) -> None:
+        """每次开新任务前清空上一次结果并上锁，URL 与本地文件共用。"""
+        self.txt_trs_result.clear()
+        self._trs_segments = []
+        self._trs_blocks = []
+        self._trs_total = 0.0
+        self._trs_session = feedback.new_session_id(kind)
+        self._fb_count = 0
+        for b in self._trs_export_btns:
+            b.setEnabled(False)
+        self.bar_trs.setValue(0)
+        self.set_transcribing(True)
+
     def _on_trs_progress(self, pct: int) -> None:
         self.bar_trs.setValue(int(pct))
 
@@ -1956,6 +2042,8 @@ class ControlPanel(QWidget):
         self.btn_trs_start.setEnabled(not busy)
         self.btn_trs_cancel.setEnabled(busy)
         self.btn_trs_pick.setEnabled(not busy)
+        for w in (self.txt_url, self.btn_url_probe, self.btn_url_go, self.btn_url_subs):
+            w.setEnabled(not busy)
         self.btn_start.setEnabled(not busy)
         self.cmb_model.setEnabled(not busy and not self._running)
         self.cmb_dev.setEnabled(not busy and not self._running)
