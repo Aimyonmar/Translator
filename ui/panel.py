@@ -605,6 +605,20 @@ class ControlPanel(QWidget):
         row6.addWidget(self.btn_proxy)
         f.addRow("", row6)
 
+        # 保活开关：默认关，关闭时不起线程、空闲零请求。
+        self.chk_keepalive = QCheckBox("翻译保活（空闲时每 15 秒 ping 一次腾讯/彩云）")
+        self.chk_keepalive.setChecked(bool(getattr(self.cfg, "enable_keepalive", False)))
+        self.chk_keepalive.setToolTip(
+            "开启后：空闲时每 15 秒向腾讯/彩云轮换发一次极短请求，保住 HTTPS 连接，\n"
+            "下次开始翻译不用重新握手（首句通常快 0.3~1.1 秒）。\n"
+            "代价：会消耗免费通道额度，约 4 次/分钟。\n"
+            "关闭（默认）：不创建保活线程，空闲时零出站请求。")
+        self.chk_keepalive.toggled.connect(self._on_keepalive)
+        lbl_ka_hint = QLabel("关闭时不创建线程、空闲零请求；开启会消耗免费额度（约 4 次/分钟）")
+        lbl_ka_hint.setStyleSheet("color: #888;")
+        f.addRow("", self.chk_keepalive)
+        f.addRow("", lbl_ka_hint)
+
         # 通道健康检查：逐个试通所有通道并显示耗时/失败原因。
         # 「译文消失」时最有用 —— 能分清是代理不通、彩云 token 失效，还是接口本身挂了。
         self.btn_health = QPushButton("通道健康检查")
@@ -1303,6 +1317,11 @@ class ControlPanel(QWidget):
         self.cfg.proxy = self.txt_proxy.text().strip()
         self._save_cfg()
         self.ctrl.on_trans_changed()
+
+    def _on_keepalive(self, *_a) -> None:
+        self.cfg.enable_keepalive = self.chk_keepalive.isChecked()
+        self._save_cfg()
+        self.ctrl.on_keepalive_changed()
 
     def _on_sens(self, v: int) -> None:
         self.cfg.sensitivity = round(v / 100.0, 2)

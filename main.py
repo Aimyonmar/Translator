@@ -289,6 +289,14 @@ class AppController:
     def on_vocal_changed(self) -> None:
         self.pipeline.update_vocal()
 
+    def on_keepalive_changed(self) -> None:
+        """保活开关：运行中打开就立即起线程，关闭就立即停；停止状态不允许自启。"""
+        if self.cfg.enable_keepalive and self.pipeline.state in ("running", "paused"):
+            self.pipeline.translator.resume_keepalive()
+            self.pipeline.translator.start_keepalive()
+        else:
+            self.pipeline.translator.stop_keepalive()
+
     def on_channel_check(self) -> None:
         """逐个试各翻译通道并把结果送到面板（后台线程跑，别卡住界面）。"""
 
