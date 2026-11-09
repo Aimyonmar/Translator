@@ -168,6 +168,9 @@ class AppConfig:
     # 可选：HTTP 代理，国内网络下用来解锁 Google / Edge 通道
     proxy: str = ""
     auto_proxy: bool = True
+    # 翻译保活：空闲时每 15 秒向免费通道发一次极短请求，保住 HTTPS 连接。
+    # 默认关闭——会消耗免费额度，用户没要求就不该在后台发请求。
+    enable_keepalive: bool = False
     # VAD
     sensitivity: float = 0.70      # 越大越灵敏（阈值越低）；直播音量普遍偏小，默认给高一点
     min_speech_ms: int = 250
