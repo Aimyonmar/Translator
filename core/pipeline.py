@@ -80,7 +80,8 @@ class Pipeline:
         # 只做只读统计，不参与任何翻译/识别决策；关掉标错也照常记（它统计的是链路本身）。
         # 需要锁只是因为翻译线程有 2 条，自增本身是纳秒级，不进任何阻塞路径。
         self._count_lock = threading.Lock()
-        self._counts = {"final": 0, "tgt": 0, "fail": 0, "hedge": 0}
+        self._counts = {"final": 0, "tgt": 0, "fail": 0, "hedge": 0,
+                        "drop_tr": 0, "drop_asr": 0, "skip": 0}
 
     # ------------------------------------------------------------ 控制
     def start(self) -> None:
@@ -107,7 +108,8 @@ class Pipeline:
         self._session_t0 = time.time()
         self.recent.clear()
         with self._count_lock:
-            self._counts = {"final": 0, "tgt": 0, "fail": 0, "hedge": 0}
+            self._counts = {"final": 0, "tgt": 0, "fail": 0, "hedge": 0,
+                            "drop_tr": 0, "drop_asr": 0, "skip": 0}
         # 上一轮 stop 抑制过保活；新一轮允许它自启（是否起线程仍由开关决定）
         self.translator.resume_keepalive()
         self.state = "loading"
@@ -268,7 +270,11 @@ class Pipeline:
         return self._session_t0
 
     def counts(self) -> dict:
-        """本场链路计数快照：上屏句数 / 有译文 / 翻译失败（原文兜底）。只读。"""
+        """本场链路计数快照：上屏 / 有译文 / 翻译失败（原文兜底）/ 丢弃来源。只读。
+
+        丢弃相关：drop_tr = 翻译队列满丢旧；drop_asr = 识别队列限流丢弃的段；
+        skip = _skip_seq 登记作废序号的次数（当前与 drop_tr 同源，用于对账）。
+        """
         with self._count_lock:
             return dict(self._counts)
 
@@ -645,8 +651,7 @@ class Pipeline:
             return item[0], item[1]
         return item, {}
 
-    @staticmethod
-    def _put_keep_newest(q: "queue.Queue", item, on_drop=None) -> None:
+    def _put_keep_newest(self, q: "queue.Queue", item, on_drop=None) -> None:
         """队列满时丢最旧的、保最新的：宁可跳掉积压的旧内容，也要让字幕跟得上当下。
 
         `on_drop` 会收到被丢掉的那一项：上屏层必须知道这个序号已经作废，
@@ -655,6 +660,8 @@ class Pipeline:
         if q.full():
             try:
                 old = q.get_nowait()
+                with self._count_lock:
+                    self._counts["drop_tr"] += 1
                 if on_drop is not None:
                     on_drop(old)
             except Exception:
@@ -667,9 +674,16 @@ class Pipeline:
             seq = item[0]
         except Exception:
             return
+        with self._count_lock:
+            self._counts["skip"] += 1
         with self._seq_lock:
             if seq >= self._next_seq:
                 self._skipped.add(seq)
+        try:
+            text = item[2] if len(item) > 2 else ""
+        except Exception:
+            text = ""
+        self.on_status(f"丢弃 #{seq}「{str(text)[:10]}」——翻译队列已满（上限 {self._tr_q.maxsize}），丢最旧")
 
     def _live_log(self, seq: int, src: str, tgt: str, meta: dict) -> None:
         """全量记录：只入队，落盘在 feedback.LiveLogWriter 的后台线程。
@@ -711,11 +725,17 @@ class Pipeline:
             limit = max(1, min(int(self.ASR_PENDING_SEC / max(self._asr_lat, 0.05)), 24))
         except Exception:
             limit = 1
+        dropped = 0
         try:
             while self._asr_q.qsize() >= limit:
                 self._asr_q.get_nowait()
+                dropped += 1
         except Exception:
             pass
+        if dropped:
+            with self._count_lock:
+                self._counts["drop_asr"] += dropped
+            self.on_status(f"丢弃 {dropped} 段待识别音频——识别积压超过上限 {limit} 段")
         try:
             self._asr_q.put_nowait(seg)
         except Exception:
