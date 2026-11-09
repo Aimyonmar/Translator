@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from typing import Callable, Optional
@@ -37,6 +38,16 @@ EST_SIZE_MB = {
 # 缺任一文件都不算可用（faster-whisper 加载必需）
 _REQUIRED = ("model.bin", "config.json", "tokenizer.json")
 
+# 修复副本：kotoba 原件的 alignment_heads 指向解码器 7~25 层，但它只有 2 层解码器，
+# ct2 的 align 不校验层号 → 开字词时间码直接原生崩溃。副本只改了 config.json
+# 里的 alignment_heads（层 1 的 20 个头），model.bin 与原快照逐字节相同。
+# 目录名特意保留 "kotoba" 便于辨认，所以能力判断必须按真实路径走，不能按名字。
+ALIGN_FIXED = {"kotoba-whisper-v2.0": "kotoba-align-fix"}
+_FIXED_REQUIRED = ("model.bin", "config.json", "tokenizer.json",
+                   "vocabulary.json", "preprocessor_config.json")
+# 该模型的解码器层数与每层头数（model.bin 实测），用来校验副本里的层号/头号
+_FIXED_DECODER_LAYERS = 2
+_FIXED_DECODER_HEADS = 20
 
 _RUNTIME_HF = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".runtime", "hf")
@@ -65,10 +76,60 @@ def load_ref(size: str) -> str:
     """给 WhisperModel 用的型号参数。
 
     自定义型号的名字（如 kotoba-whisper-v2.0）不在 faster-whisper 的内置表里，
-    直接传名字会 ValueError；已下载时改为传快照目录，顺带避免任何联网检查。"""
+    直接传名字会 ValueError；已下载时改为传快照目录，顺带避免任何联网检查。
+    有通过校验的修复副本时优先用它（字词时间码才不会崩）。"""
     if not is_custom(size):
         return size
-    return snapshot_dir(size) or repo_id(size)
+    return align_fix_dir(size) or snapshot_dir(size) or repo_id(size)
+
+
+def align_fix_dir(size: str) -> Optional[str]:
+    """kotoba 的修复副本目录；不存在、不完整或 config 非法时返回 None。
+
+    校验必须足够严：半拷贝的 model.bin 或坏掉的 config.json 一旦被交给
+    WhisperModel，要么加载失败（静默掉到 small），要么在 align 时再次崩进程。
+    所以文件齐全、model.bin 体积与原快照一致、alignment_heads 的层号/头号
+    都在解码器范围内，四条全过才算可用。"""
+    name = ALIGN_FIXED.get(size)
+    if not name:
+        return None
+    path = os.path.join(os.path.dirname(_RUNTIME_HF), "models", name)
+    if not all(os.path.exists(os.path.join(path, f)) for f in _FIXED_REQUIRED):
+        return None
+    snap = snapshot_dir(size)
+    try:
+        if snap and os.path.getsize(os.path.join(path, "model.bin")) != \
+                os.path.getsize(os.path.join(snap, "model.bin")):
+            return None
+        with open(os.path.join(path, "config.json"), encoding="utf-8") as f:
+            heads = json.load(f).get("alignment_heads")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(heads, list) or not heads:
+        return None
+    for pair in heads:
+        if not (isinstance(pair, list) and len(pair) == 2
+                and all(isinstance(v, int) for v in pair)):
+            return None
+        layer, head = pair
+        if not (0 <= layer < _FIXED_DECODER_LAYERS and 0 <= head < _FIXED_DECODER_HEADS):
+            return None
+    return path
+
+
+def is_align_fixed(ref: str) -> bool:
+    """ref 是否就是通过校验的修复副本目录（能力判断专用）。"""
+    if not ref:
+        return False
+    try:
+        target = os.path.normcase(os.path.realpath(ref))
+    except OSError:
+        return False
+    for size in ALIGN_FIXED:
+        fixed = align_fix_dir(size)
+        if fixed and os.path.normcase(os.path.realpath(fixed)) == target:
+            return True
+    return False
 
 
 def model_dir(size: str) -> str:

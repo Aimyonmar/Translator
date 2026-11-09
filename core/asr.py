@@ -89,6 +89,28 @@ def _hotwords_supported() -> bool:
     return _HOTWORDS_SUPPORTED
 
 
+# 模型自带的 alignment_heads 沿用 large-v3 的 32 层解码器层号，但 kotoba / distil
+# 是蒸馏架构（2 层解码器）。ctranslate2 的 align 不校验层号，越界读 → 进程级
+# 访问冲突（CPU 与 CUDA 一样崩，int8/float16 一样崩，见 .runtime/crash_logs）。
+# 只丢「字词时间码」，识别文本与句级时间轴不受影响，所以按模型名单直接关掉。
+WORDS_UNSAFE = ("kotoba",)
+
+
+def words_safe(model_size: str, loaded_ref: str = "") -> bool:
+    """该模型能否安全启用 word_timestamps（False = 必须关闭，否则原地崩溃）。
+
+    按名字只能判「原件」：kotoba 的快照层号越界。修复副本的目录名同样含
+    kotoba，所以必须再看实际加载的路径（loaded_ref）——只有确实是校验通过的
+    副本时才放开，否则副本缺失/损坏会自动回落成原来的降级行为。"""
+    name = (model_size or "").lower()
+    if not any(k in name for k in WORDS_UNSAFE):
+        return True
+    if not loaded_ref:
+        return False
+    from .model_store import is_align_fixed
+    return is_align_fixed(loaded_ref)
+
+
 # Whisper 在静音/噪音上会凭空吐出的固定句子（真正的幻觉）。
 # 注意：只放「整段音频没声音时才会出现的模板句」，千万不能放日常用语——
 # 「ありがとうございます」这类致谢在 VTuber 直播里高频出现，一旦列进来会被整句吞掉，
@@ -131,6 +153,7 @@ class WhisperASR:
         self._last_text = ""
         self._repeat = 0
         self.dev_info = ""        # 实际生效的设备，如 "cuda/float16" 或 "cpu/int8"
+        self.loaded_ref = ""      # 实际交给 WhisperModel 的路径/型号（判词码能力用）
         self.last_error = ""      # 最近一次识别异常，供界面提示
         # 解码宽度：beam 越小越快、越大越准。实时字幕默认 2（比 5 快约 2~3 倍，准确度几乎不掉）；
         # 面板可拖到 1（最快）或 3~5（更准）。温度回退只在低置信度时触发，不计常速。
@@ -221,11 +244,15 @@ class WhisperASR:
                     threads = min(16, os.cpu_count() or 4) if device == "cpu" else 0
                     # 自定义仓库的型号（turbo / kotoba）按本地快照目录加载：
                     # load_ref 会把缓存目录交给 WhisperModel，避免它把简称当非法型号。
+                    # kotoba 有修复副本时 load_ref 返回副本路径 —— 记下实际引用，
+                    # 后面判断「能否开字词时间码」要看它，不能只看型号名。
                     from .model_store import load_ref
+                    ref = load_ref(size)
                     self.model = WhisperModel(
-                        load_ref(size), device=device, compute_type=ct,
+                        ref, device=device, compute_type=ct,
                         **({"cpu_threads": threads} if threads else {}))
                     self._smoke()          # 真的跑一次推理，别让"缺 DLL 的 GPU"蒙混过关
+                    self.loaded_ref = ref
                     self.model_size = size
                     self._force_ja = "kotoba" in size
                     self._loaded_size = size
