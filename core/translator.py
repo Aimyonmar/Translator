@@ -98,6 +98,12 @@ class Translator:
         self.last_rule_hits: list = []
         self._route_lock = threading.Lock()
         self._gid = 0
+        # 保活线程：默认不起（cfg.enable_keepalive=False）。_ka_lock 保证同一时刻最多一条；
+        # 每轮换一个新的 Event，避免 stop→start 之间把上一轮线程「复活」。
+        self._ka_lock = threading.Lock()
+        self._ka_started = False
+        self._ka_suspended = False
+        self._ka_stop: Optional[threading.Event] = None
         self.proxy: str = getattr(cfg, "proxy", "") or ""
         # 腾讯/彩云是国内直连通道，本来就不需要代理；而本机代理（127.0.0.1:7897）经常不稳，
         # 一旦让它们走代理，译文请求会集体超时被放弃 —— 字幕就只剩原文、译文消失。
@@ -671,39 +677,86 @@ class Translator:
     def start_keepalive(self) -> None:
         """空闲时每 15 秒发一个极小请求，把 HTTPS 连接保住。
 
+        只有 cfg.enable_keepalive 为真时才创建线程（默认关闭）：关闭时零线程、零请求。
+        开关可反复切换，_ka_lock 保证同一时刻最多一条保活线程。
+
         实测：连接冷掉的第一次请求要 1.3 秒（DNS+TCP+TLS），热连接只要 0.2~0.8 秒。
         直播里两句话之间常常隔十几秒，正好落在连接被掐断的窗口上。
         """
-        self._last_req = getattr(self, "_last_req", 0.0) or time.time()
-        if getattr(self, "_ka_started", False):
+        if not getattr(self.cfg, "enable_keepalive", False):
             return
-        self._ka_started = True
-
-        def ping(ch: str) -> None:
-            try:
-                self._dispatch(ch, "あ", timeout=2.5)
-                self._last_req = time.time()
-            except Exception:
-                pass
-
-        def run():
-            while True:
-                time.sleep(15)
-                try:
-                    if self._custom_ready():       # 用户自己配了 API，不必占免费通道额度
-                        continue
-                    if time.time() - self._last_req < 15:
-                        continue
-                    # 两个通道都保温：口语句走彩云、普通句走腾讯，冷掉哪个都会拖一句
-                    for ch in ("tencent", "caiyun"):
-                        if ch not in self._dead:
-                            ping(ch)
-                except Exception:
-                    pass
-        threading.Thread(target=run, daemon=True).start()
+        self._last_req = getattr(self, "_last_req", 0.0) or time.time()
+        with self._ka_lock:
+            if self._ka_started or self._ka_suspended:
+                return
+            stop_evt = threading.Event()
+            self._ka_stop = stop_evt
+            self._ka_started = True
+            threading.Thread(target=self._keepalive_loop, args=(stop_evt,),
+                             daemon=True, name="translator-keepalive").start()
         if not self._custom_ready():
-            threading.Thread(target=lambda: (
-                ping("tencent"), ping("caiyun")), daemon=True).start()
+            threading.Thread(target=self._keepalive_ping_once, args=(stop_evt,),
+                             daemon=True, name="translator-keepalive-ping").start()
+
+    def _keepalive_ping(self, ch: str) -> None:
+        """一次极短请求。不写 _last_req：那是「真实翻译最后活跃时刻」的口径，
+        保活自己更新它会让下一轮 tick 判定为「刚翻译过」而跳过，间隔翻倍到 30 秒。"""
+        if self._custom_ready() or ch in self._dead:
+            return
+        try:
+            self._dispatch(ch, "あ", timeout=2.5)
+        except Exception:
+            pass
+
+    def _keepalive_ping_once(self, stop_evt: threading.Event) -> None:
+        """开关刚打开时立刻温一下首选通道；停止请求已下达就不再发。"""
+        for ch in ("tencent", "caiyun"):
+            if stop_evt.is_set():
+                return
+            if ch not in self._dead and not self._custom_ready():
+                self._keepalive_ping(ch)
+                return
+
+    def _keepalive_loop(self, stop_evt: threading.Event) -> None:
+        """每 15 秒 ping 一个可用通道（轮换），一分钟约 4 次，不双发浪费额度。"""
+        turn = 0
+        try:
+            while not stop_evt.wait(15):
+                if not getattr(self.cfg, "enable_keepalive", False):
+                    return
+                if self._custom_ready():       # 用户自己配了 API，不必占免费通道额度
+                    continue
+                if time.time() - getattr(self, "_last_req", 0.0) < 15:
+                    continue
+                chans = [ch for ch in ("tencent", "caiyun") if ch not in self._dead]
+                if not chans:
+                    continue
+                self._keepalive_ping(chans[turn % len(chans)])
+                turn += 1
+        finally:
+            with self._ka_lock:
+                # 只清理自己这一轮；stop→start 已被新 Event 接管时不能动新线程的状态
+                if self._ka_stop is stop_evt:
+                    self._ka_started = False
+                    self._ka_stop = None
+
+    def stop_keepalive(self) -> None:
+        """停掉保活并阻止再次自启（直到 resume_keepalive）。
+
+        线程阻塞在 Event.wait 上，set() 后立即返回并退出；Pipeline.stop() 也走这里，
+        所以程序停止后不会再有任何 ping。
+        """
+        with self._ka_lock:
+            self._ka_suspended = True
+            stop_evt, self._ka_stop = self._ka_stop, None
+            self._ka_started = False
+        if stop_evt is not None:
+            stop_evt.set()
+
+    def resume_keepalive(self) -> None:
+        """解除 stop_keepalive 的抑制（新一轮开始翻译时调用），不主动起线程。"""
+        with self._ka_lock:
+            self._ka_suspended = False
 
     def _reprobe_later(self) -> None:
         """全部通道都挂了：后台悄悄再探一次，网络恢复了下一句就能自动用上。
