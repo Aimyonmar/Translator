@@ -13,7 +13,7 @@ import numpy as np
 # 模型缓存固定在项目内的 .runtime/hf，不占用系统盘（C:\Users\xxx\.cache 默认在 C 盘）
 # 模型动辄几百 MB，放在项目里还能随项目一起搬走
 # 这里必须直接覆盖而**不能用 setdefault**：系统/用户环境里若残留别的项目设的 HF_HOME
-# （实测：已放弃的 D:\tencent\...\settings\hf），setdefault 会沿用旧路径，
+# （实测：已放弃的 <旧工作副本>\settings\hf），setdefault 会沿用旧路径，
 # 模型下到别处、下次启动又按项目目录判定「没缓存」，白下 1.5GB。
 _RUNTIME_HF = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".runtime", "hf"

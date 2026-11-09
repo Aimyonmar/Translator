@@ -8,7 +8,7 @@
 
 开启方式（PowerShell）：
     $env:TRANSLATOR_TIMING = "1"
-    $env:TRANSLATOR_TIMING_LOG = "d:\\my-project\\Translator\\.runtime\\logs\\timing.jsonl"  # 可选
+    $env:TRANSLATOR_TIMING_LOG = "<项目目录>\\.runtime\\logs\\timing.jsonl"  # 可选
 每句一行 JSON，字段见 pipeline._flush_ordered 里的 timing.record(...)。
 """
 from __future__ import annotations

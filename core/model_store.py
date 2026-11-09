@@ -57,7 +57,7 @@ def cache_root() -> str:
     """缓存目录固定为项目内 .runtime/hf，与 asr.py 一致。
 
     不读环境里的 HF_HOME：用户环境里可能残留别的项目设的旧路径
-    （实测 D:\\tencent\\workbuddy-workplace\\settings\\hf），那样面板的
+    （实测 <旧工作副本>\\settings\\hf），那样面板的
     「已下载 / 占用」会和 asr 实际加载的目录对不上。
     """
     return _RUNTIME_HF
