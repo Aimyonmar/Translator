@@ -108,6 +108,8 @@ class Pipeline:
         self.recent.clear()
         with self._count_lock:
             self._counts = {"final": 0, "tgt": 0, "fail": 0, "hedge": 0}
+        # 上一轮 stop 抑制过保活；新一轮允许它自启（是否起线程仍由开关决定）
+        self.translator.resume_keepalive()
         self.state = "loading"
         self.on_status("正在准备模型…")
         threading.Thread(target=self._boot, args=(stop_evt,), daemon=True).start()
@@ -215,6 +217,8 @@ class Pipeline:
     def stop(self) -> None:
         self._stop.set()
         self._pause.set()
+        # 程序停止后不再发保活 ping；线程在 Event.wait 上立即返回
+        self.translator.stop_keepalive()
         if self.capture:
             self.capture.stop()
             self.capture = None
