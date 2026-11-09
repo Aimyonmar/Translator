@@ -4,60 +4,25 @@
 免费通道（无需 Key）：Edge·必应 / Google / DeepL网页 / MyMemory，自动探测可用的那个。
 自定义 API（可选，质量最好）：DeepL 免费版 Key，或任意 OpenAI 兼容接口（DeepSeek、通义、豆包…）。
 代理：国内网络可填 HTTP 代理（如 http://127.0.0.1:7890）解锁 Google / Edge，程序也会自动探测本机代理端口。
+
+通道适配、主备竞速、保活等实现见 core/channels/；本文件保留 Translator 门面与翻译编排。
 """
 from __future__ import annotations
 
 import html
-import json
-import socket
 import threading
 import time
-import urllib.parse
-import uuid
 from collections import OrderedDict
 from typing import Callable, List, Optional
 
-import requests
-
-from .context import format_context, format_free_context
+from .channels import custom as ch_custom
+from .channels import free as ch_free
+from .channels import http as ch_http
+from .channels import postprocess, preprocess, racing
+from .channels.constants import (CHANNELS, CHANNEL_NAMES, COLLOQUIAL_ORDER, FREE_ORDER,
+                                 LANG_NAME_BY_CODE, LANGS, PROXY_PORTS, UA)
+from .channels.keepalive import Keepalive
 from .phrases import is_colloquial, lookup as phrase_lookup
-from .loanwords import apply_loanwords
-from .ja_norm import prepare as ja_prepare
-from .zh_polish import zh_polish
-from .zh_rules import (apply_rules as apply_zh_rules, format_hits as format_rule_hits,
-                       restore_contractions)
-
-CHANNELS = ["auto", "custom", "tencent", "caiyun", "mymemory", "edge", "google", "deepl"]
-CHANNEL_NAMES = {"auto": "自动", "custom": "自定义 API", "tencent": "腾讯翻译君",
-                 "caiyun": "彩云小译", "edge": "Edge·必应",
-                 "google": "Google", "deepl": "DeepL 网页", "mymemory": "MyMemory",
-                 "llm": "LLM 质量通道"}
-
-# 国内实测（2026-10）：腾讯 217ms / 彩云 715ms / MyMemory 831ms，
-# 且口语准确率 彩云 > 腾讯 > MyMemory。默认把最快、也够用的腾讯排前面。
-FREE_ORDER = ["tencent", "caiyun", "mymemory", "edge", "google", "deepl"]
-# 句子偏口语时优先彩云：机翻最容易把「めっちゃ眠いんだけど」翻成「今天，我睡得很好。」
-COLLOQUIAL_ORDER = ["caiyun", "tencent", "mymemory", "edge", "google", "deepl"]
-
-LANGS = {
-    "简体中文": "zh-Hans",
-    "繁體中文": "zh-Hant",
-    "English": "en",
-    "한국어": "ko",
-}
-LANG_NAME_BY_CODE = {v: k for k, v in LANGS.items()}
-
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0")
-
-# 常见本地代理端口（Clash / V2Ray / Shadowsocks / Mihomo …）
-PROXY_PORTS = [7890, 7897, 7891, 10809, 10808, 1080, 2080, 8080, 8888, 20171, 33210, 4780]
-
-_SYS_PROMPT = (
-    "你是资深日语同声传译。把用户输入的日语（VTuber 直播/视频口语）翻译成{target}。"
-    "要求：只输出译文，不要解释、不要加引号、不要保留原文；口语化、自然、简短；"
-    "保留语气词和情绪；人名/作品名/梗按常见译法或保留原文；遇到拟声词意译。"
-)
 
 
 class Translator:
@@ -71,11 +36,9 @@ class Translator:
     def __init__(self, cfg=None, on_log: Optional[Callable[[str], None]] = None):
         self.cfg = cfg
         self.log_cb = on_log
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": UA})
+        self.session = ch_http.build_session()
         self.lock = threading.Lock()
-        self._edge_token: Optional[str] = None
-        self._edge_token_ts = 0.0
+        self._edge = ch_free.EdgeAuth()
         self._cache: "OrderedDict[str, str]" = OrderedDict()
         # 上次用通的通道：冷启动直接复用，避免每次都从头把不通的通道挨个超时一遍
         # （edge/google/deepl 在国内常常要各等 10 秒才失败，首次出字幕会拖到 20-30 秒后）
@@ -98,12 +61,9 @@ class Translator:
         self.last_rule_hits: list = []
         self._route_lock = threading.Lock()
         self._gid = 0
-        # 保活线程：默认不起（cfg.enable_keepalive=False）。_ka_lock 保证同一时刻最多一条；
+        # 保活线程：默认不起（cfg.enable_keepalive=False）。同一时刻最多一条，
         # 每轮换一个新的 Event，避免 stop→start 之间把上一轮线程「复活」。
-        self._ka_lock = threading.Lock()
-        self._ka_started = False
-        self._ka_suspended = False
-        self._ka_stop: Optional[threading.Event] = None
+        self._ka = Keepalive(self)
         self.proxy: str = getattr(cfg, "proxy", "") or ""
         # 腾讯/彩云是国内直连通道，本来就不需要代理；而本机代理（127.0.0.1:7897）经常不稳，
         # 一旦让它们走代理，译文请求会集体超时被放弃 —— 字幕就只剩原文、译文消失。
@@ -156,155 +116,37 @@ class Translator:
 
     def apply_proxy(self, proxy: Optional[str] = None) -> None:
         self.proxy = proxy if proxy is not None else (getattr(self.cfg, "proxy", "") or "")
-        if self.proxy:
-            self.session.proxies.update({"http": self.proxy, "https": self.proxy})
-        else:
-            self.session.proxies.clear()
+        ch_http.apply_proxy(self.session, self.proxy)
 
     def _custom_ready(self) -> bool:
         c = self.cfg
         # 去掉空白再判空：否则手工把 Key 清成 "   " 时会被当成已配置，白占 custom 优先级
-        # （_tr_custom 里也是 strip 后为空就直接返回 None）。
+        # （custom 通道里也是 strip 后为空就直接返回 None）。
         key = (getattr(c, "custom_key", "") or "").strip()
         return bool(key and getattr(c, "custom_type", "openai"))
 
     # ---------------------------------------------------------- 通道
     def _tr_custom(self, text: str, src: str = "ja", context: str = "") -> Optional[str]:
-        c = self.cfg
-        kind = getattr(c, "custom_type", "openai")
-        key = (getattr(c, "custom_key", "") or "").strip()
-        if not key:
-            return None
-        if kind == "deepl":
-            host = "https://api-free.deepl.com" if getattr(c, "deepl_free", True) else "https://api.deepl.com"
-            lang = "ZH" if self.target in ("zh-Hans", "zh-Hant") else self.target.upper()
-            r = self.session.post(f"{host}/v2/translate", timeout=12,
-                                  data={"auth_key": key, "text": text,
-                                        "source_lang": src.upper(), "target_lang": lang})
-            r.raise_for_status()
-            return r.json()["translations"][0]["text"]
-        base = (getattr(c, "custom_base", "") or "https://api.deepseek.com/v1").rstrip("/")
-        model = getattr(c, "custom_model", "") or "deepseek-chat"
-        tname = LANG_NAME_BY_CODE.get(self.target, self.target)
-        src_name = "日语" if src in ("ja", "ja-JP", "japanese") else "英语"
-        sys_text = _SYS_PROMPT.format(target=tname).replace("日语", src_name, 1)
-        if context:
-            # 上下文只作为理解材料：先声明「不要翻译/复述」，再要求只输出当前句，
-            # 防止模型把前几轮一起翻出来（字幕里出现两句话）
-            sys_text += ("\n\n" + context
-                         + "\n只翻译用户消息里的当前句，不要复述或翻译上面的对话，"
-                           "不要补充原文没有的信息。")
-        r = self.session.post(
-            base + "/chat/completions", timeout=25,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            data=json.dumps({"model": model, "temperature": 0.2, "max_tokens": 400,
-                             "messages": [{"role": "system", "content": sys_text},
-                                          {"role": "user", "content": text}]}, ensure_ascii=False).encode("utf-8"),
-        )
-        r.raise_for_status()
-        return (r.json()["choices"][0]["message"]["content"] or "").strip()
-
-    def _edge_auth(self, timeout: float = 3.0) -> Optional[str]:
-        r = self.session.get("https://edge.microsoft.com/translate/auth", timeout=timeout)
-        r.raise_for_status()
-        self._edge_token = r.text.strip()
-        self._edge_token_ts = time.time()
-        return self._edge_token
+        return ch_custom.custom(self.session, self.cfg, self.target, text, src, context)
 
     def _tr_edge(self, text: str, src: str = "ja", timeout: float = 4.0) -> Optional[str]:
-        if not self._edge_token or time.time() - self._edge_token_ts > 480:
-            self._edge_auth(timeout)
-        tgt = "zh-Hant" if self.target == "zh-Hant" else self.target
-        url = (f"https://api-edge.cognitive.microsofttranslator.com/translate"
-               f"?api-version=3.0&from={src}&to={tgt}")
-        for attempt in (0, 1):
-            if attempt:
-                self._edge_token = None
-                self._edge_auth()
-            r = self.session.post(url, timeout=4,
-                                  headers={"Authorization": f"Bearer {self._edge_token}",
-                                           "Content-Type": "application/json"},
-                                  data=json.dumps([{"Text": text}], ensure_ascii=False).encode("utf-8"))
-            if r.status_code == 401 and attempt == 0:
-                continue
-            r.raise_for_status()
-            return r.json()[0]["translations"][0]["text"]
-        return None
+        return ch_free.edge(self.session, self._edge, self.target, text, src, timeout)
 
     def _tr_google(self, text: str, src: str = "ja", timeout: float = 4.0) -> Optional[str]:
-        tl = {"zh-Hans": "zh-CN", "zh-Hant": "zh-TW"}.get(self.target, self.target)
-        url = ("https://translate.googleapis.com/translate_a/single?client=gtx"
-               f"&sl={src}&tl={tl}&dt=t&q={urllib.parse.quote(text)}")
-        r = self.session.get(url, timeout=timeout)
-        r.raise_for_status()
-        return "".join(p[0] for p in r.json()[0] if p and p[0])
+        return ch_free.google(self.session, self.target, text, src, timeout)
 
     def _tr_deepl(self, text: str, src: str = "ja", timeout: float = 4.0) -> Optional[str]:
-        lang = "ZH" if self.target in ("zh-Hans", "zh-Hant") else self.target.upper()
-        body = {"jsonrpc": "2.0", "method": "LMT_handle_texts",
-                "params": {"texts": [{"text": text, "requestAlternatives": 0}],
-                           "splitting": "newlines",
-                           "lang": {"source_lang_user_selected": src.upper(), "target_lang": lang},
-                           "commonJobParams": {"formality": None, "mode": "translate"},
-                           "timestamp": int(time.time() * 1000)},
-                "id": int(uuid.uuid4().int % 100000000) * 1000}
-        r = self.session.post("https://www2.deepl.com/jsonrpc", json=body, timeout=timeout,
-                              headers={"Content-Type": "application/json"})
-        r.raise_for_status()
-        data = r.json()
-        if "error" in data:
-            raise RuntimeError(data["error"].get("message", "deepl error"))
-        return data["result"]["texts"][0]["text"]
+        return ch_free.deepl(self.session, self.target, text, src, timeout)
 
     def _tr_mymemory(self, text: str, src: str = "ja", timeout: float = 4.0) -> Optional[str]:
-        tl = {"zh-Hans": "zh-CN", "zh-Hant": "zh-TW"}.get(self.target, self.target)
-        r = self.session.get("https://api.mymemory.translated.net/get", timeout=timeout,
-                             params={"q": text, "langpair": f"{src}|{tl}"})
-        r.raise_for_status()
-        data = r.json()
-        out = (data.get("responseData") or {}).get("translatedText") or ""
-        return html.unescape(out).strip()
+        return ch_free.mymemory(self.session, self.target, text, src, timeout)
 
     def _tr_tencent(self, text: str, src: str = "ja", timeout: float = 4.0) -> Optional[str]:
-        """腾讯翻译君网页接口：国内直连，实测 90~300ms，是目前最快的免费通道。"""
-        tgt = {"zh-Hans": "zh", "zh-Hant": "zh-TW"}.get(self.target, self.target)
-        r = self.session.post(
-            "https://transmart.qq.com/api/imt", timeout=timeout,
-            proxies=self._no_proxy,          # 国内直连，强制不走代理
-            headers={"Content-Type": "application/json"},
-            data=json.dumps({
-                "header": {"fn": "auto_translation",
-                           "client_key": "browser-chrome-124-0-Windows-10-0"},
-                "source": {"text_list": [text], "lang": src},
-                "target": {"lang": tgt},
-            }, ensure_ascii=False).encode("utf-8"),
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("header", {}).get("ret_code") != "succ":
-            raise RuntimeError(data.get("message") or "tencent error")
-        out = (data.get("auto_translation") or [""])[0]
-        return html.unescape(out).strip()
+        return ch_free.tencent(self.session, self._no_proxy, self.target, text, src, timeout)
 
     def _tr_caiyun(self, text: str, src: str = "ja", timeout: float = 4.0) -> Optional[str]:
-        """彩云小译：口语/俗语理解明显好于机翻，实测「めっちゃ眠いんだけど」能翻对。"""
-        token = (getattr(self.cfg, "caiyun_token", "") or "").strip()
-        if not token:
-            raise RuntimeError("未配置彩云 token")
-        tgt = {"zh-Hans": "zh", "zh-Hant": "zh-Hant", "en": "en"}.get(self.target, "zh")
-        pair = f"{src}2{tgt}"
-        r = self.session.post(
-            "https://api.interpreter.caiyunai.com/v1/translator", timeout=timeout,
-            proxies=self._no_proxy,          # 国内直连，强制不走代理
-            headers={"Content-Type": "application/json", "X-Authorization": f"token {token}"},
-            data=json.dumps({"source": [text], "trans_type": pair},
-                            ensure_ascii=False).encode("utf-8"),
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("rc") not in (0, None):
-            raise RuntimeError(f"caiyun rc={data.get('rc')}")
-        return html.unescape((data.get("target") or [""])[0]).strip()
+        return ch_free.caiyun(self.session, self._no_proxy, self.cfg, self.target,
+                              text, src, timeout)
 
     def _tr_llm(self, text: str, src: str = "ja", context: str = "") -> Optional[str]:
         """LLM 质量通道：不可用或失败都返回 None，由调用方回落免费通道。"""
@@ -359,32 +201,9 @@ class Translator:
         # 本句的主备赛跑结果（是否备胎救回、晚到多少、谁胜出），没走主备时为 None
         self._tls.hedge = None
         # 上下文块在本地拼装（<0.1ms）：只有能接受 system prompt 的 custom 通道用得上
-        ctx_block = ""
-        if context and self.cfg is not None and getattr(self.cfg, "enable_context", True) \
-                and (self._custom_ready() or self._llm_ready()):
-            try:
-                ctx_block = format_context(
-                    context,
-                    getattr(self.cfg, "context_glossary", "") or "",
-                    int(getattr(self.cfg, "context_window", 3)),
-                )
-            except Exception:
-                ctx_block = ""
-        # 免费通道的语境前缀：独立开关、默认关闭。只取最近一句原文且截到 60 字，
-        # 前缀越短，「整段一起翻/复述」的概率和延迟增量越小。
-        free_ctx = ""
-        if context and getattr(self.cfg, "enable_free_context", False):
-            try:
-                free_ctx = format_free_context(context)
-            except Exception:
-                free_ctx = ""
-        # 带上下文/带前缀的译文与单句译文可能不同，缓存 key 必须区分，避免串味
-        if ctx_block:
-            cache_key = (text, hash(ctx_block))
-        elif free_ctx:
-            cache_key = (text, "free", free_ctx)
-        else:
-            cache_key = text
+        ctx_block, free_ctx = preprocess.build_context(
+            self.cfg, context, self._custom_ready() or self._llm_ready())
+        cache_key = preprocess.cache_key(text, ctx_block, free_ctx)
         # 只在这一小段里持锁：网络请求绝不能放进锁里——
         # 之前整段都锁着，2 路并发翻译实际退化成串行排队，实测单句要等 4.7 秒。
         # 先查本地口语表：命中就是 0ms，且译文是人工校准过的，比任何免费机翻都准
@@ -403,32 +222,8 @@ class Translator:
                 return hit
             order = self._order(text)
             custom = self._custom_ready()
-            # 送翻前的两级清洗（都在本地、0ms）：
-            # 1) ja_norm：展开口语缩约（「置いてってます」→「置いていきました」）+
-            #    折叠 ASR 重复子句（「相当してください、相当ください」→ 只留一句）；
-            # 2) loanwords：片假名外来语换成人工校准的中文义（アプデ=更新…）。
-            # 两者都对着「上屏的原文」做，缓存 key 仍用原始 text，译文不串味。
-            pro = text
-            if getattr(self.cfg, "enable_zh_rules", False):
-                # 缩略还原属于送翻前处理：只展开歧义小的口语形（っつー/すんの…）
-                pro, _c_notes = restore_contractions(pro)
-            pro = ja_prepare(pro)
-            if getattr(self.cfg, "enable_loanwords", True):
-                pro = apply_loanwords(pro)
-            # 翻译侧术语表：把专名换成人定的中文名再送翻（整词精确匹配）。
-            # 标题术语表在上游已经先做过一轮，这里只补用户/诊断新增的词，不会重复替换。
-            if getattr(self.cfg, "enable_translate_glossary", False):
-                try:
-                    from .tr_glossary import apply_source
-                    pro, g_notes = apply_source(
-                        pro, getattr(self.cfg, "translate_glossary", "") or "")
-                    for n in g_notes:
-                        self._say(f"术语替换：{n}")
-                except Exception:
-                    pass
-            # 整句基本是拉丁字母（主播真在说英文，而非片假名外来语）：改走 EN→ZH 路由
-            en_route = getattr(self.cfg, "enable_en_route", True) and self._looks_english(text)
-            src = "en" if en_route else self.source
+            # 送翻前的两级清洗都在本地（0ms），详见 core/channels/preprocess.py
+            pro, src = preprocess.prepare(text, self.cfg, self.source, self._say)
 
         last_err = None
         gid = self._next_gid()      # A/B：同一句的线路记录共用这个号
@@ -479,7 +274,7 @@ class Translator:
             # 甚至整段改写成一句话。只认换行分段、只取最后一段（当前句）；
             # 切不开或长度明显超长就当作污染，用干净单句重发一次，拿不到就换通道。
             if use_free:
-                seg = self._split_free_segment(out)
+                seg = postprocess.split_free_segment(out)
                 if seg is None or len(seg) > max(60, len(text) * 3):
                     self._say("免费语境分段失败，回退单句")
                     left = deadline - time.time()
@@ -504,34 +299,12 @@ class Translator:
             # 这里绝不能 continue 去试其它通道：edge/google/deepl 都要等满超时，
             # 实测会把这句的翻译拖到 12 秒，字幕就彻底跟不上说话了。
             # 直接放弃译文，让界面只显示原文。
-            if self._is_junk(text, out):
+            if postprocess.is_junk(text, out):
                 return None
-            # 译文口语化润色（确定性规则、0ms）：免费通道的固定生硬模式
-            # （伙计们→大家、您→你、想尝试→想试试、半角标点、句尾书面句号）。
-            # 规则只动词级与标点，绝不动句法——润色失败顶多不自然，不引入新错误。
-            if getattr(self.cfg, "enable_zh_polish", True):
-                out = zh_polish(out)
-            # 规则化译后处理（默认开）：终助词语气、惯用句、数词单位、授受方向、主语。
-            # 放在 zh_polish 之后，避免标点归一化把刚补的语气词再改一遍。
-            if getattr(self.cfg, "enable_zh_rules", True):
-                before_rules = out
-                out, r_notes = apply_zh_rules(
-                    text, out, getattr(self.cfg, "zh_rules", "") or "")
-                if r_notes:
-                    self.last_rule_hits = r_notes
-                    # 日志带规则 id：一条错改能直接定位到「关掉哪个 id」
-                    self._say("规则[%s] %s → %s"
-                              % (",".join(format_rule_hits(r_notes)), before_rules, out))
-            # 术语表译文兜底：只回改诊断里实测过的坏译法（蒙汉世界→怪物猎人：世界），
-            # 命中才动；用户词表不参与译后替换，避免把正常中文改回日文。
-            if getattr(self.cfg, "enable_translate_glossary", False):
-                try:
-                    from .tr_glossary import apply_target
-                    out, t_notes = apply_target(out)
-                    for n in t_notes:
-                        self._say(f"术语回改：{n}")
-                except Exception:
-                    pass
+            # 译后润色与规则改写（都在本地、0ms），详见 core/channels/postprocess.py
+            out, rule_hits = postprocess.polish(self.cfg, text, out, self._say)
+            if rule_hits:
+                self.last_rule_hits = rule_hits
             with self.lock:
                 self._cache[cache_key] = out
                 if len(self._cache) > 800:
@@ -597,61 +370,18 @@ class Translator:
         返回 (译文, 通道)；两条都不给可用译文时返回 None，交回原来的串行兜底。
         败方请求在后台跑完后会把往返记进 route_log，供 A/B 统计，不阻塞上屏。
         """
-        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-
-        # 完成时刻（相对 t0）按通道记：用来算「备胎比主通道晚多久到」
-        t0 = time.perf_counter()
-        done_at: dict = {}
-
         def work(ch):
             try:
-                out = self._timed_fire(ch, text, src, timeout=timeout, gid=gid)
-                done_at[ch] = time.perf_counter() - t0
-                return out
+                return self._timed_fire(ch, text, src, timeout=timeout, gid=gid)
             except Exception:
-                done_at[ch] = time.perf_counter() - t0
                 # 与串行路径一致：确认不通就本次会话不再重试，否则主备模式会每句都
                 # 先撞一次同一个坏通道
                 with self.lock:
                     self._dead.add(ch)
                 return None
 
-        ex = ThreadPoolExecutor(max_workers=2)
-        futs = {ex.submit(work, chs[0]): chs[0]}
-        fired = 1
-        if delay_ms <= 0 and len(chs) > 1:
-            futs[ex.submit(work, chs[1])] = chs[1]
-            fired = 2
-        best = None
-        while futs and best is None:
-            if fired < len(chs) and delay_ms > 0:
-                left = delay_ms / 1000.0 - (time.perf_counter() - t0)
-                if left > 0:
-                    done, _ = wait(list(futs), timeout=left, return_when=FIRST_COMPLETED)
-                else:
-                    done = set()
-            else:
-                done, _ = wait(list(futs), timeout=timeout + 0.5,
-                               return_when=FIRST_COMPLETED)
-            if not done:
-                if fired < len(chs):       # 主通道到点还没回：补发备份
-                    futs[ex.submit(work, chs[1])] = chs[1]
-                    fired += 1
-                    continue
-                break
-            for f in done:
-                ch = futs.pop(f)
-                try:
-                    out = f.result()
-                except Exception:
-                    out = None
-                if out and out.strip() and not self._is_junk(text, out):
-                    best = (out, ch)
-                    break
-                if fired < len(chs):       # 主通道先失败了：立刻补发备份
-                    futs[ex.submit(work, chs[1])] = chs[1]
-                    fired += 1
-        ex.shutdown(wait=False)
+        best, done_at, fired = racing.race(
+            chs, work, lambda out: not self._is_junk(text, out), timeout, delay_ms)
         # 上报口径：rescued=胜出的是备胎；late_ms=备胎完成比主通道完成晚多少（都拿到时刻才算，
         # 主通道超时/失败时没有参照，记 None）；winner=最终胜出通道。
         info = None
@@ -674,71 +404,17 @@ class Translator:
         self._tls.hedge = info
         return best
 
+    # ---------------------------------------------------------- 保活
     def start_keepalive(self) -> None:
         """空闲时每 15 秒发一个极小请求，把 HTTPS 连接保住。
 
         只有 cfg.enable_keepalive 为真时才创建线程（默认关闭）：关闭时零线程、零请求。
-        开关可反复切换，_ka_lock 保证同一时刻最多一条保活线程。
+        开关可反复切换，同一时刻最多一条保活线程。
 
         实测：连接冷掉的第一次请求要 1.3 秒（DNS+TCP+TLS），热连接只要 0.2~0.8 秒。
         直播里两句话之间常常隔十几秒，正好落在连接被掐断的窗口上。
         """
-        if not getattr(self.cfg, "enable_keepalive", False):
-            return
-        self._last_req = getattr(self, "_last_req", 0.0) or time.time()
-        with self._ka_lock:
-            if self._ka_started or self._ka_suspended:
-                return
-            stop_evt = threading.Event()
-            self._ka_stop = stop_evt
-            self._ka_started = True
-            threading.Thread(target=self._keepalive_loop, args=(stop_evt,),
-                             daemon=True, name="translator-keepalive").start()
-        if not self._custom_ready():
-            threading.Thread(target=self._keepalive_ping_once, args=(stop_evt,),
-                             daemon=True, name="translator-keepalive-ping").start()
-
-    def _keepalive_ping(self, ch: str) -> None:
-        """一次极短请求。不写 _last_req：那是「真实翻译最后活跃时刻」的口径，
-        保活自己更新它会让下一轮 tick 判定为「刚翻译过」而跳过，间隔翻倍到 30 秒。"""
-        if self._custom_ready() or ch in self._dead:
-            return
-        try:
-            self._dispatch(ch, "あ", timeout=2.5)
-        except Exception:
-            pass
-
-    def _keepalive_ping_once(self, stop_evt: threading.Event) -> None:
-        """开关刚打开时立刻温一下首选通道；停止请求已下达就不再发。"""
-        for ch in ("tencent", "caiyun"):
-            if stop_evt.is_set():
-                return
-            if ch not in self._dead and not self._custom_ready():
-                self._keepalive_ping(ch)
-                return
-
-    def _keepalive_loop(self, stop_evt: threading.Event) -> None:
-        """每 15 秒 ping 一个可用通道（轮换），一分钟约 4 次，不双发浪费额度。"""
-        turn = 0
-        try:
-            while not stop_evt.wait(15):
-                if not getattr(self.cfg, "enable_keepalive", False):
-                    return
-                if self._custom_ready():       # 用户自己配了 API，不必占免费通道额度
-                    continue
-                if time.time() - getattr(self, "_last_req", 0.0) < 15:
-                    continue
-                chans = [ch for ch in ("tencent", "caiyun") if ch not in self._dead]
-                if not chans:
-                    continue
-                self._keepalive_ping(chans[turn % len(chans)])
-                turn += 1
-        finally:
-            with self._ka_lock:
-                # 只清理自己这一轮；stop→start 已被新 Event 接管时不能动新线程的状态
-                if self._ka_stop is stop_evt:
-                    self._ka_started = False
-                    self._ka_stop = None
+        self._ka.start()
 
     def stop_keepalive(self) -> None:
         """停掉保活并阻止再次自启（直到 resume_keepalive）。
@@ -746,17 +422,11 @@ class Translator:
         线程阻塞在 Event.wait 上，set() 后立即返回并退出；Pipeline.stop() 也走这里，
         所以程序停止后不会再有任何 ping。
         """
-        with self._ka_lock:
-            self._ka_suspended = True
-            stop_evt, self._ka_stop = self._ka_stop, None
-            self._ka_started = False
-        if stop_evt is not None:
-            stop_evt.set()
+        self._ka.stop()
 
     def resume_keepalive(self) -> None:
         """解除 stop_keepalive 的抑制（新一轮开始翻译时调用），不主动起线程。"""
-        with self._ka_lock:
-            self._ka_suspended = False
+        self._ka.resume()
 
     def _reprobe_later(self) -> None:
         """全部通道都挂了：后台悄悄再探一次，网络恢复了下一句就能自动用上。
@@ -776,49 +446,18 @@ class Translator:
 
     @staticmethod
     def _looks_english(text: str) -> bool:
-        """整句基本是拉丁字母（主播真在说英文，而不是片假名外来语）：
-        这种情况直接走 EN→ZH 路由，比默认 JA→ZH 准得多。
-        片假名外来语不算——它们由 apply_loanwords 在翻译前处理成正确中文义。"""
-        if len([c for c in text if c.isascii() and c.isalpha()]) < 3:
-            return False
-        latin = sum(1 for c in text if ("a" <= c <= "z") or ("A" <= c <= "Z"))
-        non_space = sum(1 for c in text if not c.isspace())
-        if non_space == 0:
-            return False
-        return latin / non_space > 0.7
+        """整句基本是拉丁字母（主播真在说英文，而不是片假名外来语）。"""
+        return preprocess.looks_english(text)
 
     @staticmethod
     def _split_free_segment(out: str) -> Optional[str]:
-        """从「前缀+当前句」的译文里取出当前句：只认换行分段。
-
-        免费通道没有上下文参数，只能把前文拼在待翻译文本前面；译文一般会保留
-        换行，取最后一段就是当前句。切不开（只有一段）返回 None，交给调用方
-        判定为污染并回退单句——绝不猜句子边界，猜错就会把上一句译文顶上来。
-        """
-        if not out:
-            return None
-        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-        if len(lines) < 2:
-            return None
-        return lines[-1]
+        """从「前缀+当前句」的译文里取出当前句：只认换行分段。"""
+        return postprocess.split_free_segment(out)
 
     @staticmethod
     def _is_junk(src: str, out: str) -> bool:
-        """垃圾译文识别，命中就丢弃（只显示原文），两不换通道重试：
-        1. 原文很短、译文却长到离谱 —— 免费通道返回的拼凑乱码。
-        2. 译文是同一个短片段重复 4 次以上 —— 实测 MyMemory 把「やばいやばいやばい」
-           翻成「狗屎狗屎狗屎狗屎狗屎狗屎狗屎」。注意阈值取 4：彩云给的
-           「糟糕糟糕糟糕」是正确译文，只有 3 次重复，不能误杀。
-        """
-        if len(src) <= 12 and len(out) > max(20, len(src) * 4):
-            return True
-        n = len(out)
-        for unit in (1, 2, 3):
-            if n >= unit * 4 and n % unit == 0:
-                piece = out[:unit]
-                if out == piece * (n // unit) and n // unit >= 4:
-                    return True
-        return False
+        """垃圾译文识别，命中就丢弃（只显示原文），不换通道重试。"""
+        return postprocess.is_junk(src, out)
 
     def health_check(self, timeout: float = 2.5) -> List[tuple]:
         """逐个试各翻译通道并计时，供面板「通道健康检查」用。
@@ -886,34 +525,8 @@ class Translator:
     # ---------------------------------------------------------- 代理
     @staticmethod
     def _port_open(port: int) -> bool:
-        s = socket.socket()
-        s.settimeout(0.3)
-        try:
-            s.connect(("127.0.0.1", port))
-            return True
-        except Exception:
-            return False
-        finally:
-            s.close()
+        return ch_http.port_open(port)
 
     def detect_local_proxy(self) -> Optional[str]:
         """扫描本机常见代理端口，能用就返回代理地址。"""
-        saved = dict(self.session.proxies)
-        try:
-            for port in PROXY_PORTS:
-                if not self._port_open(port):
-                    continue
-                url = f"http://127.0.0.1:{port}"
-                try:
-                    r = requests.get(
-                        "https://translate.googleapis.com/translate_a/single"
-                        "?client=gtx&sl=ja&tl=zh-CN&dt=t&q=" + urllib.parse.quote("こんにちは"),
-                        headers={"User-Agent": UA}, proxies={"http": url, "https": url}, timeout=7)
-                    if r.status_code == 200 and r.json():
-                        return url
-                except Exception:
-                    continue
-        finally:
-            self.session.proxies.clear()
-            self.session.proxies.update(saved)
-        return None
+        return ch_http.detect_local_proxy(self.session)
