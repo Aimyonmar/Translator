@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QDialog, QKeySequenceEdit,
 )
 
-from core import feedback, model_store, zh_audio
+from core import feedback, model_store, lang_mode
 from core.asr import MODEL_SIZES
 from ui.global_hotkey import DEFAULT_HOTKEY, GlobalHotkey, parse_hotkey
 from core.translator import CHANNELS, CHANNEL_NAMES, LANGS
@@ -112,6 +112,7 @@ class ControlPanel(QWidget):
         self.sig_channel_result.connect(self._show_channel_result)
         self._build()
         self._refresh_model_hint()
+        self._refresh_route()
         # 必须放在 _build() 之后：txt_proxy 等控件是在 _build() 里创建的
         self.sig_devices.connect(self.set_devices)
         self.sig_proxy_text.connect(self.txt_proxy.setText)
@@ -153,7 +154,6 @@ class ControlPanel(QWidget):
     # 顶部传输栏 / 左侧分页 / 右侧内容区 的骨架不用改。
     PAGES: Tuple[Tuple[str, str, str], ...] = (
         ("device", "设备", "_build_page_device"),
-        ("zh_audio", "中文音频", "_build_page_zh_audio"),
         ("asr", "识别", "_build_page_asr"),
         ("trans", "翻译", "_build_page_trans"),
         ("context", "语境", "_build_page_context"),
@@ -255,11 +255,42 @@ class ControlPanel(QWidget):
         self.bar.setTextVisible(False)
         lbl_vol = QLabel("音量")
         lbl_vol.setObjectName("hint")
+        self.lbl_route = QLabel(lang_mode.route_text(self.cfg))
+        self.lbl_route.setObjectName("hint")
+        self.lbl_route.setToolTip("当前实际路由：输入语言 → 译文 · 识别模型")
         head.addWidget(self.lbl_counts)
         head.addWidget(self.lbl_state)
         head.addWidget(lbl_vol)
         head.addWidget(self.bar)
         v.addLayout(head)
+
+        # 输入语言三档固定在顶栏：任何页面、任何滚动位置都能一键切换与切回。
+        # 每档自带模型与目标语言，切换即落盘并立刻重载，不依赖某个分页里的下拉。
+        row_mode = QHBoxLayout()
+        row_mode.setSpacing(6)
+        lbl_mode = QLabel("输入语言")
+        lbl_mode.setObjectName("hint")
+        row_mode.addWidget(lbl_mode)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_btns = {}
+        for mode in lang_mode.MODES:
+            btn = QPushButton(lang_mode.MODE_LABELS[mode])
+            btn.setCheckable(True)
+            btn.setFixedHeight(30)
+            preset = lang_mode.PRESETS[mode]
+            btn.setToolTip("输入 %s · 模型 %s · 译文 %s" % (
+                lang_mode.SOURCE_LABELS[preset["source"]],
+                preset["model"],
+                lang_mode.TARGET_LABELS[preset["target"]]))
+            btn.clicked.connect(lambda _c=False, m=mode: self._set_input_mode(m))
+            self._mode_group.addButton(btn)
+            self._mode_btns[mode] = btn
+            row_mode.addWidget(btn)
+        row_mode.addStretch(1)
+        row_mode.addWidget(self.lbl_route)
+        v.addLayout(row_mode)
+        self._sync_mode_ui()
 
         # 主操作固定在顶栏：切到哪一页、内容滚到哪，开始/暂停/隐藏字幕都点得到
         row = QHBoxLayout()
@@ -353,46 +384,11 @@ class ControlPanel(QWidget):
         self.stack.setCurrentWidget(sc)
         # 滚轮过滤器与预览工具都按「当前页的滚动区」工作
         self.scroll = sc
-        # 模型/语言可能在别的页被改过，进页时按现状刷新三处核对结果
-        if key == "zh_audio":
-            self._refresh_zh_page()
         btn = self._nav_buttons.get(key)
         if btn is not None and not btn.isChecked():
             btn.setChecked(True)
 
     # ------------------------------------------------------------ 分页
-    def _build_page_zh_audio(self) -> QWidget:
-        """中文音频独立入口：一次把音频语言、模型档、目标语言三处切到位。"""
-        page, root = self._page_shell()
-        box = QGroupBox("中文音频 → English（独立入口）")
-        v = QVBoxLayout(box)
-        desc = QLabel(
-            "抓取电脑正在播放的中文音频：中文原文实时上屏，同时给出英文译文。\n"
-            "本页会一次性核对并切好三处：音频语言=中文、识别模型=通用档（避开日语专用的\n"
-            "kotoba-whisper-v2.0）、目标语言=English。开始后顶栏状态会显示实际生效的路由。\n"
-            "复制在「实时记录」里：可复制选中句或整段。")
-        desc.setWordWrap(True)
-        v.addWidget(desc)
-        self.lbl_zh_status = QLabel("")
-        self.lbl_zh_status.setObjectName("hint")
-        self.lbl_zh_status.setWordWrap(True)
-        v.addWidget(self.lbl_zh_status)
-        row = QHBoxLayout()
-        self.btn_zh_apply = QPushButton("仅应用设置")
-        self.btn_zh_apply.setFixedHeight(36)
-        self.btn_zh_apply.clicked.connect(self._apply_zh_audio)
-        self.btn_zh_start = QPushButton("应用设置并开始翻译")
-        self.btn_zh_start.setObjectName("primary")
-        self.btn_zh_start.setFixedHeight(38)
-        self.btn_zh_start.clicked.connect(self._start_zh_audio)
-        row.addWidget(self.btn_zh_apply)
-        row.addWidget(self.btn_zh_start, 1)
-        v.addLayout(row)
-        root.addWidget(box)
-        root.addStretch(1)
-        self._refresh_zh_page()
-        return page
-
     def _build_page_device(self) -> QWidget:
         page, root = self._page_shell()
 
@@ -563,19 +559,18 @@ class ControlPanel(QWidget):
         row_vc.addWidget(self.sp_vocal)
         row_vc.addStretch(1)
         f.addRow("", row_vc)
-        # 音频语言：决定 Whisper 按哪种语言解码。默认日语（老行为不变）；
-        # 选中文时联动把目标语言切到英文，并避开日语专用的 kotoba 档。
+        # 音频语言：与顶栏三档开关同源（这里保留为识别页的明细入口）。
         self.cmb_src_lang = QComboBox()
-        self.cmb_src_lang.addItem("日本語", "ja")
+        self.cmb_src_lang.addItem("English", "en")
         self.cmb_src_lang.addItem("中文", "zh")
+        self.cmb_src_lang.addItem("日本語", "ja")
         _cur_src = getattr(self.cfg, "source_lang", "ja") or "ja"
         _src_idx = self.cmb_src_lang.findData(_cur_src)
-        self.cmb_src_lang.setCurrentIndex(_src_idx if _src_idx >= 0 else 0)
+        self.cmb_src_lang.setCurrentIndex(_src_idx if _src_idx >= 0 else 2)
         self.cmb_src_lang.setToolTip(
-            "电脑里正在播放的音频语言。\n"
-            "选「中文」：中文原文上屏，译文自动切到 English；\n"
-            "kotoba-whisper-v2.0 是日语专用档，中文会被强行按日语解码而失真，\n"
-            "所以选中文时若正用 kotoba，会自动换成 small。")
+            "电脑里正在播放的音频语言，与顶栏三档开关联动。\n"
+            "每档会自动配好模型与译文：English→small/简体中文，中文→small/English，\n"
+            "日本語→kotoba-whisper-v2.0/简体中文。")
         self.cmb_src_lang.currentIndexChanged.connect(self._on_src_lang_changed)
         row_src = QHBoxLayout()
         row_src.addWidget(self.cmb_src_lang)
@@ -1192,37 +1187,36 @@ class ControlPanel(QWidget):
             self.cmb_lang.blockSignals(True)
             self.cmb_lang.setCurrentText(tname)
             self.cmb_lang.blockSignals(False)
+        self._sync_mode_ui()
+        self._refresh_route()
 
-    def _refresh_zh_page(self) -> None:
-        if not hasattr(self, "lbl_zh_status"):
+    def _sync_mode_ui(self) -> None:
+        """顶栏三档按钮跟随 cfg.source_lang，保证从任何入口改完都指向同一档。"""
+        if not getattr(self, "_mode_btns", None):
             return
-        pipe = getattr(self.ctrl, "pipeline", None)
-        self.lbl_zh_status.setText(
-            zh_audio.status_text(self.cfg, getattr(pipe, "asr", None)))
+        mode = lang_mode.detect(self.cfg)
+        for key, btn in self._mode_btns.items():
+            btn.blockSignals(True)
+            btn.setChecked(key == mode)
+            btn.blockSignals(False)
 
-    def _apply_zh_audio(self) -> list:
-        """独立入口的核心动作：三处一次切到位并落盘。"""
-        notes = zh_audio.apply(self.cfg)
+    def _refresh_route(self) -> None:
+        if hasattr(self, "lbl_route"):
+            self.lbl_route.setText(lang_mode.route_text(self.cfg))
+
+    def _set_input_mode(self, mode: str) -> list:
+        """切换输入语言：源语言、模型、目标语言一次到位，并立刻生效。"""
+        notes = lang_mode.apply(self.cfg, mode)
         self._sync_lang_ui()
-        self._save_cfg("中文音频")
-        self.ctrl.on_model_changed()
+        self._save_cfg("输入语言")
+        # 先清翻译缓存/更新目标语言，再让识别层对齐（运行中会后台重载模型）
         self.ctrl.on_trans_changed()
+        self.ctrl.on_model_changed()
         self._refresh_model_hint()
-        self._refresh_zh_page()
-        self._log("中文音频预设：" + ("；".join(notes) if notes
-                                     else "音频语言/模型/目标语言均已是中文 → English"))
+        self._refresh_route()
+        self._log("输入语言：" + lang_mode.route_text(self.cfg)
+                  + ("（%s）" % "；".join(notes) if notes else "（三处均已就位）"))
         return notes
-
-    def _start_zh_audio(self) -> None:
-        """应用预设后直接开始；若正在跑别的方向，先停再按新方向重启。"""
-        if self._mdl_busy or self._transcribing:
-            self._log("模型缓存或音频转写进行中，完成后再开始中文音频")
-            return
-        pipe = getattr(self.ctrl, "pipeline", None)
-        if getattr(pipe, "state", "stopped") in ("running", "loading", "paused"):
-            self.ctrl.toggle_start()
-        self._apply_zh_audio()
-        self.ctrl.toggle_start()
 
     def _on_model_changed(self, *_a) -> None:
         self.cfg.model_size = self.cmb_model.currentText()
@@ -1232,16 +1226,16 @@ class ControlPanel(QWidget):
         self._save_cfg()
         self.ctrl.on_model_changed()
         self._refresh_model_hint()
-        self._refresh_zh_page()
+        self._refresh_route()
 
     _MODEL_HINT = "large-v3 单句耗时约为 small 的 3 倍；追求实时性保持 small。"
 
     def _refresh_model_hint(self) -> None:
-        """中文 + kotoba 是无效组合：在模型提示行上明确警告。"""
+        """非日语输入 + kotoba 是无效组合：在模型提示行上明确警告。"""
         src = getattr(self.cfg, "source_lang", "ja") or "ja"
-        if src == "zh" and "kotoba" in (self.cfg.model_size or ""):
+        if src != "ja" and "kotoba" in (self.cfg.model_size or ""):
             self.lbl_model_hint.setText(
-                "⚠ kotoba-whisper-v2.0 是日语专用模型，中文会被按日语解码而失真；"
+                "⚠ kotoba-whisper-v2.0 是日语专用模型，非日语音频会被按日语解码而失真；"
                 "请改用 small / large-v3-turbo / large-v3。")
             self.lbl_model_hint.setStyleSheet("color:#d9534f;")
         else:
@@ -1249,42 +1243,8 @@ class ControlPanel(QWidget):
             self.lbl_model_hint.setStyleSheet("")
 
     def _on_src_lang_changed(self, *_a) -> None:
-        """切换音频语言：写配置、避开 kotoba、联动目标语言。"""
-        lang = self.cmb_src_lang.currentData() or "ja"
-        self.cfg.source_lang = lang
-        notes = []
-        if lang == "zh" and "kotoba" in (self.cfg.model_size or ""):
-            # 日语专用档解码中文会失真，直接换成通用档
-            self.cfg.model_size = "small"
-            self.cmb_model.blockSignals(True)
-            self.cmb_model.setCurrentText("small")
-            self.cmb_model.blockSignals(False)
-            notes.append("kotoba 是日语专用模型，已自动换成 small")
-        # 只在两个默认方向之间联动；用户自选的其他目标语言不覆盖
-        tgt = getattr(self.cfg, "target_lang", "zh-Hans") or "zh-Hans"
-        new_tgt = None
-        if lang == "zh" and tgt == "zh-Hans":
-            new_tgt = "en"
-        elif lang == "ja" and tgt == "en":
-            new_tgt = "zh-Hans"
-        if new_tgt:
-            self.cfg.target_lang = new_tgt
-            name = next((k for k, v in LANGS.items() if v == new_tgt), None)
-            if name:
-                self.cmb_lang.blockSignals(True)
-                self.cmb_lang.setCurrentText(name)
-                self.cmb_lang.blockSignals(False)
-            notes.append("目标语言切到 %s" % (name or new_tgt))
-        self._save_cfg("音频语言")
-        self.ctrl.on_model_changed()
-        self._refresh_model_hint()
-        msg = "音频语言：%s → %s" % (
-            "中文" if lang == "zh" else "日本語",
-            "英语" if self.cfg.target_lang == "en" else "简体中文")
-        if notes:
-            msg += "（%s）" % "；".join(notes)
-        self._log(msg)
-        self._refresh_zh_page()
+        """识别页的下拉只是顶栏三档的另一个入口，逻辑完全一致。"""
+        self._set_input_mode(self.cmb_src_lang.currentData() or "ja")
 
     # ------------------------------------------------------------ 模型缓存
     def _refresh_models(self) -> None:
@@ -1466,6 +1426,7 @@ class ControlPanel(QWidget):
         idx = self.cmb_channel.currentIndex()
         self.cfg.channel = CHANNELS[idx] if 0 <= idx < len(CHANNELS) else "auto"
         self.cfg.target_lang = LANGS.get(self.cmb_lang.currentText(), "zh-Hans")
+        self._refresh_route()
         self._save_cfg()
         self.ctrl.on_trans_changed()
 

@@ -71,8 +71,8 @@ _SERVER = None
 
 
 def lang_model_mismatch(cfg) -> bool:
-    """中文音频 + kotoba（日语专用档）会让解码失真，启动前必须拦住。"""
-    return (getattr(cfg, "source_lang", "ja") == "zh"
+    """非日语输入 + kotoba（日语专用档）会让解码失真，启动前必须拦住。"""
+    return (getattr(cfg, "source_lang", "ja") != "ja"
             and "kotoba" in (getattr(cfg, "model_size", "") or ""))
 
 
@@ -633,12 +633,11 @@ class AppController:
             # 面板切换语言时已自动换模型；这里兜住手改 config.json、旧配置等情况。
             if lang_model_mismatch(self.cfg):
                 QMessageBox.warning(
-                    self.panel, "模型与音频语言不匹配",
-                    "当前音频语言是中文，但识别模型是 kotoba-whisper-v2.0"
-                    "（日语专用）。用它解码中文会失真。\n\n"
-                    "请先到「中文音频」页点「应用设置并开始翻译」，"
-                    "或到「识别」页把模型换成 small / large-v3-turbo / "
-                    "large-v3，再开始翻译。")
+                    self.panel, "模型与输入语言不匹配",
+                    "当前输入语言不是日语，但识别模型是 kotoba-whisper-v2.0"
+                    "（日语专用）。用它解码会失真。\n\n"
+                    "请在顶栏「输入语言」里重新选择 English / 中文 / 日本語，"
+                    "三档会自动配好对应模型与译文。")
                 return
             self.pipeline.start()
             self.panel.set_running(True)

@@ -22,7 +22,7 @@ from .vad import SpeechSegmenter
 from .denoise import Denoise
 from . import feedback
 from . import timing
-from .zh_audio import SOURCE_LABELS, TARGET_LABELS
+from .lang_mode import SOURCE_LABELS, TARGET_LABELS
 
 
 class Pipeline:
@@ -153,8 +153,8 @@ class Pipeline:
             if (getattr(self.asr, "_force_ja", False)
                     and getattr(self.cfg, "source_lang", "ja") != "ja"):
                 self.state = "error"
-                self.on_status("识别模型仍是 kotoba（日语专用），不能用于中文音频；"
-                               "请到「中文音频」页点「仅应用设置」后再开始")
+                self.on_status("识别模型仍是 kotoba（日语专用），不能用于非日语音频；"
+                               "请在顶栏「输入语言」重新选择 English / 中文 / 日本語后再开始")
                 return
             if self.asr.dev_info.startswith("cpu") and getattr(self.cfg, "gpu_ok", True):
                 self.cfg.gpu_ok = False
