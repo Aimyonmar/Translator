@@ -22,6 +22,7 @@ from .vad import SpeechSegmenter
 from .denoise import Denoise
 from . import feedback
 from . import timing
+from .zh_audio import SOURCE_LABELS, TARGET_LABELS
 
 
 class Pipeline:
@@ -138,9 +139,22 @@ class Pipeline:
             # 失败多半是显存被游戏临时占满，重启后显存空了就该回 GPU。
             # load() 内部按显存余量自动选档并逐级降级，GPU 真不可用时
             # 几秒内就会落到可用组合，不会像以前那样白等。
-            self.asr.load(on_progress=self.on_status)
-            # 冷启动加载要十几秒，这期间用户可能已经点了停止
-            if aborted():
+            # 加载竞态兜底：预热可能还在加载 kotoba 时用户就切到了中文，
+            # 实际加载的档与要用的档不一致就卸载重来一次，绝不拿日语档解中文。
+            for _try in range(2):
+                self.asr.load(on_progress=self.on_status)
+                # 冷启动加载要十几秒，这期间用户可能已经点了停止
+                if aborted():
+                    return
+                if not (getattr(self.asr, "_force_ja", False)
+                        and getattr(self.cfg, "source_lang", "ja") != "ja"):
+                    break
+                self.asr.unload()
+            if (getattr(self.asr, "_force_ja", False)
+                    and getattr(self.cfg, "source_lang", "ja") != "ja"):
+                self.state = "error"
+                self.on_status("识别模型仍是 kotoba（日语专用），不能用于中文音频；"
+                               "请到「中文音频」页点「仅应用设置」后再开始")
                 return
             if self.asr.dev_info.startswith("cpu") and getattr(self.cfg, "gpu_ok", True):
                 self.cfg.gpu_ok = False
@@ -207,7 +221,7 @@ class Pipeline:
             return
         self.state = "running"
         self._cap_restarts = 0
-        self.on_status(f"正在聆听…（系统声音 · {self.asr.model_size} {self.asr.dev_info}）")
+        self.on_status(f"正在聆听…（{self.route_summary()}）")
         # 采集 1 路、识别 1 路（GPU 很快）、翻译 2 路并发。
         # 并发别开太高：免费 MyMemory 会限流，开 4 路反而把请求拖到十几秒。
         for fn, n in ((self._capture_loop, 1), (self._asr_loop, 1), (self._trans_loop, 2)):
@@ -381,7 +395,20 @@ class Pipeline:
         self.asr.device = self.cfg.asr_device
         self.asr.compute_type = self.cfg.compute_type
         self.asr.language = self.cfg.source_lang
+        # _force_ja 必须跟着「想要加载的档」立刻更新：模型重载要十几秒，
+        # 这段窗口里若还按旧 kotoba 标记返回 ja，中文会先被当日语解出几句。
+        self.asr._force_ja = "kotoba" in (self.cfg.model_size or "")
         self._sync_beam()
+
+    def route_summary(self) -> str:
+        """当前实际路由：解码语言 → 目标语言 · 模型/设备。
+
+        开始翻译时写进状态栏，让「配置改了但没生效」一眼可见。
+        """
+        lang = self.asr._lang() or "auto"
+        src = SOURCE_LABELS.get(lang, "自动" if lang == "auto" else lang)
+        tgt = TARGET_LABELS.get(self.cfg.target_lang, self.cfg.target_lang)
+        return f"{src} → {tgt} · {self.asr.model_size} {self.asr.dev_info}"
 
     def _sync_beam(self) -> None:
         """large-v* 模型较重，默认用最快解码宽度（beam=1）保实时性；其余模型保持
@@ -541,21 +568,24 @@ class Pipeline:
                         merged += 1
             t_asr_start = time.perf_counter()
             t0 = time.time()
+            # 名字纠错 / 热词 / 同音词都是日语专用资产（假名读音、日语专名）。
+            # 中文音频下发这些热词会把解码往日语带，必须整段跳过。
+            is_ja = getattr(self.cfg, "source_lang", "ja") == "ja"
             roster = ""
-            if getattr(self.cfg, "enable_namefix", True):
+            if is_ja and getattr(self.cfg, "enable_namefix", True):
                 # 用户词表 + 内置标题（用户优先）：kotoba 不能开热词，
                 # 这里是 エルジェンリング→エルデンリング 这类错名的唯一纠错通道。
                 from .namefix import merge_roster
                 roster = merge_roster(self.cfg.name_roster or "")
             hotwords = ""
-            if getattr(self.cfg, "enable_hotwords", True):
+            if is_ja and getattr(self.cfg, "enable_hotwords", True):
                 # 热词 = 用户词表 + 内置游戏/番剧标题，**汉字/片假名原样**下发
                 # （2026-10-13 实测：用假名读音反而把解码带偏，CER 7.1%→26.1%）。
                 # 这里只传用户词表，内置由 hotword_text 自己加，避免与 roster 重复。
                 from .namefix import hotword_text
                 hotwords = hotword_text(self.cfg.name_roster or "",
                                         builtin=bool(getattr(self.cfg, "builtin_titles", True)))
-            text = self.asr.transcribe(seg, word_map=self.cfg.word_map,
+            text = self.asr.transcribe(seg, word_map=self.cfg.word_map if is_ja else "",
                                        roster=roster, hotwords=hotwords)
             t_asr_end = time.perf_counter()
             # 识别是最长的一段耗时：停止请求若发生在识别途中，这里必须及时收手，
@@ -570,7 +600,7 @@ class Pipeline:
                     continue
             # 语境同音词纠正（変身→返信）：只有「含错形 + 有线索 + 无反向线索」才改，
             # 每次改动都上报，便于发现改错后关掉 enable_homophone_fix
-            if text and getattr(self.cfg, "enable_homophone_fix", True):
+            if is_ja and text and getattr(self.cfg, "enable_homophone_fix", True):
                 try:
                     text, fixes = fix_homophones(
                         text, self.context.sources(int(getattr(self.cfg, "context_window", 3))))

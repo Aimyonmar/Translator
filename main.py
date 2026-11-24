@@ -636,7 +636,8 @@ class AppController:
                     self.panel, "模型与音频语言不匹配",
                     "当前音频语言是中文，但识别模型是 kotoba-whisper-v2.0"
                     "（日语专用）。用它解码中文会失真。\n\n"
-                    "请先到「识别」页把模型换成 small / large-v3-turbo / "
+                    "请先到「中文音频」页点「应用设置并开始翻译」，"
+                    "或到「识别」页把模型换成 small / large-v3-turbo / "
                     "large-v3，再开始翻译。")
                 return
             self.pipeline.start()

@@ -61,14 +61,14 @@ def split_free_segment(out: str) -> Optional[str]:
     return lines[-1]
 
 
-def is_junk(src: str, out: str) -> bool:
+def is_junk(src: str, out: str, source: str = "ja") -> bool:
     """垃圾译文识别，命中就丢弃（只显示原文），不换通道重试：
     1. 原文很短、译文却长到离谱 —— 免费通道返回的拼凑乱码。
     2. 译文是同一个短片段重复 4 次以上 —— 实测 MyMemory 把「やばいやばいやばい」
        翻成「狗屎狗屎狗屎狗屎狗屎狗屎狗屎」。注意阈值取 4：彩云给的
        「糟糕糟糕糟糕」是正确译文，只有 3 次重复，不能误杀。
     """
-    if len(src) <= 12 and len(out) > max(20, len(src) * 4):
+    if source == "ja" and len(src) <= 12 and len(out) > max(20, len(src) * 4):
         return True
     n = len(out)
     for unit in (1, 2, 3):

@@ -253,7 +253,11 @@ class WhisperASR:
                         **({"cpu_threads": threads} if threads else {}))
                     self._smoke()          # 真的跑一次推理，别让"缺 DLL 的 GPU"蒙混过关
                     self.loaded_ref = ref
-                    self.model_size = size
+                    # 加载期间用户可能改了模型档（例如预热还在加载 kotoba 时切到
+                    # 中文，面板把模型改成 small）。此时不能把旧档写回 model_size，
+                    # 否则「配置是 small、实际在跑 kotoba」，中文会被按日语解码。
+                    if self.model_size == asked:
+                        self.model_size = size
                     self._force_ja = "kotoba" in size
                     self._loaded_size = size
                     self.dev_info = f"{device}/{ct}" + (f" x{threads}" if threads else "")

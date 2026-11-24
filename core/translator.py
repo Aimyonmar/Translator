@@ -203,7 +203,9 @@ class Translator:
         # 上下文块在本地拼装（<0.1ms）：只有能接受 system prompt 的 custom 通道用得上
         ctx_block, free_ctx = preprocess.build_context(
             self.cfg, context, self._custom_ready() or self._llm_ready())
-        cache_key = preprocess.cache_key(text, ctx_block, free_ctx)
+        # 缓存 key 带上语言对：切换音频语言/目标语言后，不能命中上一套方向的译文
+        cache_key = (self.source, self.target,
+                     preprocess.cache_key(text, ctx_block, free_ctx))
         # 只在这一小段里持锁：网络请求绝不能放进锁里——
         # 之前整段都锁着，2 路并发翻译实际退化成串行排队，实测单句要等 4.7 秒。
         # 先查本地口语表：命中就是 0ms，且译文是人工校准过的，比任何免费机翻都准
@@ -213,7 +215,9 @@ class Translator:
                 # 反复出现的口头禅会被一次性新句挤掉，白白重发请求
                 self._cache.move_to_end(cache_key)
                 return self._cache[cache_key]
-            hit = phrase_lookup(text)
+            # 本口语表是日语 → 中文的人工校准结果，其他语言方向不能套用
+            hit = phrase_lookup(text) if (
+                self.source == "ja" and str(self.target).startswith("zh")) else None
             if hit:
                 self._cache[cache_key] = hit
                 self._phrase_hits = getattr(self, "_phrase_hits", 0) + 1
@@ -299,7 +303,7 @@ class Translator:
             # 这里绝不能 continue 去试其它通道：edge/google/deepl 都要等满超时，
             # 实测会把这句的翻译拖到 12 秒，字幕就彻底跟不上说话了。
             # 直接放弃译文，让界面只显示原文。
-            if postprocess.is_junk(text, out):
+            if postprocess.is_junk(text, out, self.source):
                 return None
             # 译后润色与规则改写（都在本地、0ms），详见 core/channels/postprocess.py
             out, rule_hits = postprocess.polish(self.cfg, text, out, self._say)

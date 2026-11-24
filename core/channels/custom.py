@@ -10,10 +10,12 @@ import requests
 from .constants import LANG_NAME_BY_CODE
 
 _SYS_PROMPT = (
-    "你是资深日语同声传译。把用户输入的日语（VTuber 直播/视频口语）翻译成{target}。"
+    "你是资深同声传译。把用户输入的{source}（直播/视频口语）翻译成{target}。"
     "要求：只输出译文，不要解释、不要加引号、不要保留原文；口语化、自然、简短；"
     "保留语气词和情绪；人名/作品名/梗按常见译法或保留原文；遇到拟声词意译。"
 )
+# 源语言显示名：以前只认 ja / 其他，中文会被当成英语写进 system prompt
+_SRC_NAMES = {"ja": "日语", "zh": "中文", "en": "英语"}
 
 
 def custom(session: requests.Session, cfg, target: str,
@@ -33,8 +35,8 @@ def custom(session: requests.Session, cfg, target: str,
     base = (getattr(cfg, "custom_base", "") or "https://api.deepseek.com/v1").rstrip("/")
     model = getattr(cfg, "custom_model", "") or "deepseek-chat"
     tname = LANG_NAME_BY_CODE.get(target, target)
-    src_name = "日语" if src in ("ja", "ja-JP", "japanese") else "英语"
-    sys_text = _SYS_PROMPT.format(target=tname).replace("日语", src_name, 1)
+    src_name = _SRC_NAMES.get((src or "ja").split("-")[0].lower(), "原文")
+    sys_text = _SYS_PROMPT.format(source=src_name, target=tname)
     if context:
         # 上下文只作为理解材料：先声明「不要翻译/复述」，再要求只输出当前句，
         # 防止模型把前几轮一起翻出来（字幕里出现两句话）

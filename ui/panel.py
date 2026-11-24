@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QDialog, QKeySequenceEdit,
 )
 
-from core import feedback, model_store
+from core import feedback, model_store, zh_audio
 from core.asr import MODEL_SIZES
 from ui.global_hotkey import DEFAULT_HOTKEY, GlobalHotkey, parse_hotkey
 from core.translator import CHANNELS, CHANNEL_NAMES, LANGS
@@ -153,6 +153,7 @@ class ControlPanel(QWidget):
     # 顶部传输栏 / 左侧分页 / 右侧内容区 的骨架不用改。
     PAGES: Tuple[Tuple[str, str, str], ...] = (
         ("device", "设备", "_build_page_device"),
+        ("zh_audio", "中文音频", "_build_page_zh_audio"),
         ("asr", "识别", "_build_page_asr"),
         ("trans", "翻译", "_build_page_trans"),
         ("context", "语境", "_build_page_context"),
@@ -352,11 +353,46 @@ class ControlPanel(QWidget):
         self.stack.setCurrentWidget(sc)
         # 滚轮过滤器与预览工具都按「当前页的滚动区」工作
         self.scroll = sc
+        # 模型/语言可能在别的页被改过，进页时按现状刷新三处核对结果
+        if key == "zh_audio":
+            self._refresh_zh_page()
         btn = self._nav_buttons.get(key)
         if btn is not None and not btn.isChecked():
             btn.setChecked(True)
 
     # ------------------------------------------------------------ 分页
+    def _build_page_zh_audio(self) -> QWidget:
+        """中文音频独立入口：一次把音频语言、模型档、目标语言三处切到位。"""
+        page, root = self._page_shell()
+        box = QGroupBox("中文音频 → English（独立入口）")
+        v = QVBoxLayout(box)
+        desc = QLabel(
+            "抓取电脑正在播放的中文音频：中文原文实时上屏，同时给出英文译文。\n"
+            "本页会一次性核对并切好三处：音频语言=中文、识别模型=通用档（避开日语专用的\n"
+            "kotoba-whisper-v2.0）、目标语言=English。开始后顶栏状态会显示实际生效的路由。\n"
+            "复制在「实时记录」里：可复制选中句或整段。")
+        desc.setWordWrap(True)
+        v.addWidget(desc)
+        self.lbl_zh_status = QLabel("")
+        self.lbl_zh_status.setObjectName("hint")
+        self.lbl_zh_status.setWordWrap(True)
+        v.addWidget(self.lbl_zh_status)
+        row = QHBoxLayout()
+        self.btn_zh_apply = QPushButton("仅应用设置")
+        self.btn_zh_apply.setFixedHeight(36)
+        self.btn_zh_apply.clicked.connect(self._apply_zh_audio)
+        self.btn_zh_start = QPushButton("应用设置并开始翻译")
+        self.btn_zh_start.setObjectName("primary")
+        self.btn_zh_start.setFixedHeight(38)
+        self.btn_zh_start.clicked.connect(self._start_zh_audio)
+        row.addWidget(self.btn_zh_apply)
+        row.addWidget(self.btn_zh_start, 1)
+        v.addLayout(row)
+        root.addWidget(box)
+        root.addStretch(1)
+        self._refresh_zh_page()
+        return page
+
     def _build_page_device(self) -> QWidget:
         page, root = self._page_shell()
 
@@ -1139,6 +1175,55 @@ class ControlPanel(QWidget):
         if dev is not None:
             self.ctrl.on_device_selected(dev)
 
+    def _sync_lang_ui(self) -> None:
+        """把配置里的音频语言 / 模型 / 目标语言写回控件，期间屏蔽信号。"""
+        idx = self.cmb_src_lang.findData(self.cfg.source_lang)
+        if idx >= 0:
+            self.cmb_src_lang.blockSignals(True)
+            self.cmb_src_lang.setCurrentIndex(idx)
+            self.cmb_src_lang.blockSignals(False)
+        midx = self.cmb_model.findText(self.cfg.model_size)
+        if midx >= 0:
+            self.cmb_model.blockSignals(True)
+            self.cmb_model.setCurrentIndex(midx)
+            self.cmb_model.blockSignals(False)
+        tname = next((k for k, v in LANGS.items() if v == self.cfg.target_lang), None)
+        if tname:
+            self.cmb_lang.blockSignals(True)
+            self.cmb_lang.setCurrentText(tname)
+            self.cmb_lang.blockSignals(False)
+
+    def _refresh_zh_page(self) -> None:
+        if not hasattr(self, "lbl_zh_status"):
+            return
+        pipe = getattr(self.ctrl, "pipeline", None)
+        self.lbl_zh_status.setText(
+            zh_audio.status_text(self.cfg, getattr(pipe, "asr", None)))
+
+    def _apply_zh_audio(self) -> list:
+        """独立入口的核心动作：三处一次切到位并落盘。"""
+        notes = zh_audio.apply(self.cfg)
+        self._sync_lang_ui()
+        self._save_cfg("中文音频")
+        self.ctrl.on_model_changed()
+        self.ctrl.on_trans_changed()
+        self._refresh_model_hint()
+        self._refresh_zh_page()
+        self._log("中文音频预设：" + ("；".join(notes) if notes
+                                     else "音频语言/模型/目标语言均已是中文 → English"))
+        return notes
+
+    def _start_zh_audio(self) -> None:
+        """应用预设后直接开始；若正在跑别的方向，先停再按新方向重启。"""
+        if self._mdl_busy or self._transcribing:
+            self._log("模型缓存或音频转写进行中，完成后再开始中文音频")
+            return
+        pipe = getattr(self.ctrl, "pipeline", None)
+        if getattr(pipe, "state", "stopped") in ("running", "loading", "paused"):
+            self.ctrl.toggle_start()
+        self._apply_zh_audio()
+        self.ctrl.toggle_start()
+
     def _on_model_changed(self, *_a) -> None:
         self.cfg.model_size = self.cmb_model.currentText()
         self.cfg.asr_device = self.cmb_dev.currentText()
@@ -1147,6 +1232,7 @@ class ControlPanel(QWidget):
         self._save_cfg()
         self.ctrl.on_model_changed()
         self._refresh_model_hint()
+        self._refresh_zh_page()
 
     _MODEL_HINT = "large-v3 单句耗时约为 small 的 3 倍；追求实时性保持 small。"
 
@@ -1198,6 +1284,7 @@ class ControlPanel(QWidget):
         if notes:
             msg += "（%s）" % "；".join(notes)
         self._log(msg)
+        self._refresh_zh_page()
 
     # ------------------------------------------------------------ 模型缓存
     def _refresh_models(self) -> None:

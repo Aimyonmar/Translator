@@ -29,11 +29,12 @@ PROVIDERS = {
 }
 
 _SYS = (
-    "你是资深日语同声传译，把 VTuber 直播里的日语口语翻成{target}。"
+    "你是资深同声传译，把直播里的{source}口语翻成{target}。"
     "规则：只输出译文，不要解释、不要加引号；口语化、简短；保留语气词和情绪；"
     "人名/作品名用通行译法，没有通行译法就保留原文；拟声词意译；"
     "上下文只用于理解指代和省略，不要翻译或复述上下文。"
 )
+_SRC_NAMES = {"ja": "日语", "zh": "中文", "en": "英语"}
 
 
 class LLMTranslator:
@@ -76,9 +77,8 @@ class LLMTranslator:
         if not self.available or not text:
             return None
         base = PROVIDERS[self.provider]["base"].rstrip("/")
-        sys_text = _SYS.format(target=self._target())
-        if src == "en":
-            sys_text = sys_text.replace("日语", "英语", 1)
+        src_name = _SRC_NAMES.get((src or "ja").split("-")[0].lower(), "原文")
+        sys_text = _SYS.format(source=src_name, target=self._target())
         if context:
             sys_text += "\n\n" + context
         body = {
