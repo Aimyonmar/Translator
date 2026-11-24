@@ -9,7 +9,14 @@ from ..zh_rules import apply_rules as apply_zh_rules, format_hits as format_rule
 
 
 def polish(cfg, text: str, out: str, say) -> Tuple[str, List[str]]:
-    """润色 + 规则改写 + 术语回改，返回 (译文, 命中的规则列表)。"""
+    """润色 + 规则改写 + 术语回改，返回 (译文, 命中的规则列表)。
+
+    zh_polish / zh_rules / 术语回改都只面向中文译文。目标语言不是中文
+    （如中文音频配英文译文）时全部跳过，否则中文规则会改写英文输出。
+    """
+    target = str(getattr(cfg, "target_lang", "zh-Hans") or "zh-Hans")
+    if not target.startswith("zh"):
+        return out, []
     # 译文口语化润色（确定性规则、0ms）：免费通道的固定生硬模式
     # （伙计们→大家、您→你、想尝试→想试试、半角标点、句尾书面句号）。
     # 规则只动词级与标点，绝不动句法——润色失败顶多不自然，不引入新错误。

@@ -634,7 +634,9 @@ class Pipeline:
         # 机翻不认识游戏名（实测「原神→上帝」「エルデンリング→埃尔金戒指」），
         # 先把中文名塞进源文里，机翻就会照抄。上屏的原文保持识别原样，所以带两份。
         tr_text = text
-        if getattr(self.cfg, "enable_title_glossary", True):
+        # 标题术语表是日语专名 → 中文名的映射，非日语音频不要套用
+        if (getattr(self.cfg, "source_lang", "ja") == "ja"
+                and getattr(self.cfg, "enable_title_glossary", True)):
             try:
                 from .namefix import apply_title_glossary
                 tr_text = apply_title_glossary(
@@ -803,7 +805,9 @@ class Pipeline:
             # 译文兜底：原文已认对（如「返信」）但译文仍出现固定错译（「变身」）时改回
             disp_text, out, meta, t_tr_start, t_tr_end = item
             t_screen = time.perf_counter()
-            if out and getattr(self.cfg, "enable_homophone_fix", True):
+            # 同音词纠错只针对日语原文（中文音频套用会把正常译文改坏）
+            if (out and getattr(self.cfg, "source_lang", "ja") == "ja"
+                    and getattr(self.cfg, "enable_homophone_fix", True)):
                 try:
                     out, fixes = fix_translation(disp_text, out)
                     for note in fixes:

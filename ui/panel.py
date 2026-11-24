@@ -111,6 +111,7 @@ class ControlPanel(QWidget):
         self.sig_log.connect(self._log)
         self.sig_channel_result.connect(self._show_channel_result)
         self._build()
+        self._refresh_model_hint()
         # 必须放在 _build() 之后：txt_proxy 等控件是在 _build() 里创建的
         self.sig_devices.connect(self.set_devices)
         self.sig_proxy_text.connect(self.txt_proxy.setText)
@@ -526,6 +527,24 @@ class ControlPanel(QWidget):
         row_vc.addWidget(self.sp_vocal)
         row_vc.addStretch(1)
         f.addRow("", row_vc)
+        # 音频语言：决定 Whisper 按哪种语言解码。默认日语（老行为不变）；
+        # 选中文时联动把目标语言切到英文，并避开日语专用的 kotoba 档。
+        self.cmb_src_lang = QComboBox()
+        self.cmb_src_lang.addItem("日本語", "ja")
+        self.cmb_src_lang.addItem("中文", "zh")
+        _cur_src = getattr(self.cfg, "source_lang", "ja") or "ja"
+        _src_idx = self.cmb_src_lang.findData(_cur_src)
+        self.cmb_src_lang.setCurrentIndex(_src_idx if _src_idx >= 0 else 0)
+        self.cmb_src_lang.setToolTip(
+            "电脑里正在播放的音频语言。\n"
+            "选「中文」：中文原文上屏，译文自动切到 English；\n"
+            "kotoba-whisper-v2.0 是日语专用档，中文会被强行按日语解码而失真，\n"
+            "所以选中文时若正用 kotoba，会自动换成 small。")
+        self.cmb_src_lang.currentIndexChanged.connect(self._on_src_lang_changed)
+        row_src = QHBoxLayout()
+        row_src.addWidget(self.cmb_src_lang)
+        row_src.addStretch(1)
+        f.addRow("音频语言", row_src)
         # 解码宽度（速度 / 准确度权衡）：large-v3 想再快就拖到 1
         self.sp_beam = QSpinBox()
         self.sp_beam.setRange(1, 5)
@@ -743,11 +762,19 @@ class ControlPanel(QWidget):
         self.btn_live_txt = QPushButton("导出 TXT")
         self.btn_live_srt = QPushButton("导出 SRT")
         self.btn_live_ass = QPushButton("导出 ASS")
+        # 复制只做在面板记录里：单句（先点选）与整段；悬浮字幕窗不提供复制
+        self.btn_live_copy_one = QPushButton("复制选中句")
+        self.btn_live_copy_one.setToolTip("先在下方记录里点一句，再点这里复制该句原文与译文")
+        self.btn_live_copy_all = QPushButton("复制全部")
+        self.btn_live_copy_all.setToolTip("复制整段记录：每句原文一行、译文一行，句间空行")
+        self.btn_live_copy_one.clicked.connect(self._copy_live_one)
+        self.btn_live_copy_all.clicked.connect(self._copy_live_all)
         self.btn_live_clear.clicked.connect(self._on_live_clear)
         self.btn_live_txt.clicked.connect(lambda: self._export_live("txt"))
         self.btn_live_srt.clicked.connect(lambda: self._export_live("srt"))
         self.btn_live_ass.clicked.connect(lambda: self._export_live("ass"))
-        for b in (self.btn_live_clear, self.btn_live_txt, self.btn_live_srt,
+        for b in (self.btn_live_copy_one, self.btn_live_copy_all,
+                  self.btn_live_clear, self.btn_live_txt, self.btn_live_srt,
                   self.btn_live_ass):
             b.setEnabled(False)
             row_live.addWidget(b)
@@ -1119,6 +1146,58 @@ class ControlPanel(QWidget):
         self.cfg.gpu_ok = True
         self._save_cfg()
         self.ctrl.on_model_changed()
+        self._refresh_model_hint()
+
+    _MODEL_HINT = "large-v3 单句耗时约为 small 的 3 倍；追求实时性保持 small。"
+
+    def _refresh_model_hint(self) -> None:
+        """中文 + kotoba 是无效组合：在模型提示行上明确警告。"""
+        src = getattr(self.cfg, "source_lang", "ja") or "ja"
+        if src == "zh" and "kotoba" in (self.cfg.model_size or ""):
+            self.lbl_model_hint.setText(
+                "⚠ kotoba-whisper-v2.0 是日语专用模型，中文会被按日语解码而失真；"
+                "请改用 small / large-v3-turbo / large-v3。")
+            self.lbl_model_hint.setStyleSheet("color:#d9534f;")
+        else:
+            self.lbl_model_hint.setText(self._MODEL_HINT)
+            self.lbl_model_hint.setStyleSheet("")
+
+    def _on_src_lang_changed(self, *_a) -> None:
+        """切换音频语言：写配置、避开 kotoba、联动目标语言。"""
+        lang = self.cmb_src_lang.currentData() or "ja"
+        self.cfg.source_lang = lang
+        notes = []
+        if lang == "zh" and "kotoba" in (self.cfg.model_size or ""):
+            # 日语专用档解码中文会失真，直接换成通用档
+            self.cfg.model_size = "small"
+            self.cmb_model.blockSignals(True)
+            self.cmb_model.setCurrentText("small")
+            self.cmb_model.blockSignals(False)
+            notes.append("kotoba 是日语专用模型，已自动换成 small")
+        # 只在两个默认方向之间联动；用户自选的其他目标语言不覆盖
+        tgt = getattr(self.cfg, "target_lang", "zh-Hans") or "zh-Hans"
+        new_tgt = None
+        if lang == "zh" and tgt == "zh-Hans":
+            new_tgt = "en"
+        elif lang == "ja" and tgt == "en":
+            new_tgt = "zh-Hans"
+        if new_tgt:
+            self.cfg.target_lang = new_tgt
+            name = next((k for k, v in LANGS.items() if v == new_tgt), None)
+            if name:
+                self.cmb_lang.blockSignals(True)
+                self.cmb_lang.setCurrentText(name)
+                self.cmb_lang.blockSignals(False)
+            notes.append("目标语言切到 %s" % (name or new_tgt))
+        self._save_cfg("音频语言")
+        self.ctrl.on_model_changed()
+        self._refresh_model_hint()
+        msg = "音频语言：%s → %s" % (
+            "中文" if lang == "zh" else "日本語",
+            "英语" if self.cfg.target_lang == "en" else "简体中文")
+        if notes:
+            msg += "（%s）" % "；".join(notes)
+        self._log(msg)
 
     # ------------------------------------------------------------ 模型缓存
     def _refresh_models(self) -> None:
@@ -1444,10 +1523,42 @@ class ControlPanel(QWidget):
                 self._fb_selected = None
             sb.setValue(sb.maximum())
         has = bool(self._live_records)
+        self.btn_live_copy_one.setEnabled(has)
+        self.btn_live_copy_all.setEnabled(has)
         self.btn_live_clear.setEnabled(has)
         self.btn_live_txt.setEnabled(has)
         self.btn_live_srt.setEnabled(has)
         self.btn_live_ass.setEnabled(has)
+
+    @staticmethod
+    def _live_copy_text(rec: Tuple[float, float, str, str]) -> str:
+        """单句复制格式：原文一行、译文一行（没有译文只复制原文）。"""
+        _a, _b, src, tgt = rec
+        return src + ("\n" + tgt if tgt else "")
+
+    def _copy_live_one(self) -> None:
+        """复制选中的那一句；未选中时提示，不去猜「最近一句」。"""
+        sel = self._fb_selected
+        if (sel is None or sel[0] != "live"
+                or not (0 <= sel[1] < len(self._live_records))):
+            self.lbl_live_out.setText("先在实时记录里点选一句，再点「复制选中句」")
+            return
+        idx = sel[1]
+        QApplication.clipboard().setText(
+            self._live_copy_text(self._live_records[idx]))
+        self.lbl_live_out.setText(
+            f"已复制第 {idx + 1} 句（共 {len(self._live_records)} 句）")
+        self._log(f"已复制实时记录第 {idx + 1} 句")
+
+    def _copy_live_all(self) -> None:
+        """复制整段记录：每句原文/译文各一行，句间空一行。"""
+        if not self._live_records:
+            return
+        text = "\n\n".join(self._live_copy_text(r) for r in self._live_records)
+        QApplication.clipboard().setText(text)
+        n = len(self._live_records)
+        self.lbl_live_out.setText(f"已复制全部 {n} 句记录")
+        self._log(f"已复制实时记录全部 {n} 句")
 
     def _live_update_out_label(self) -> None:
         folder = (self.cfg.export_dir or "").strip()
@@ -1471,6 +1582,8 @@ class ControlPanel(QWidget):
         if self._fb_selected is not None and self._fb_selected[0] == "live":
             self._fb_selected = None
         self.txt_live.clear()
+        self.btn_live_copy_one.setEnabled(False)
+        self.btn_live_copy_all.setEnabled(False)
         self.btn_live_clear.setEnabled(False)
         self.btn_live_txt.setEnabled(False)
         self.btn_live_srt.setEnabled(False)

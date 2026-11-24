@@ -50,7 +50,13 @@ def prepare(text: str, cfg, source: str, say) -> Tuple[str, str]:
     2) loanwords：片假名外来语换成人工校准的中文义（アプデ=更新…）。
     术语表把专名换成人定的中文名再送翻（整词精确匹配）。
     两者都对着「上屏的原文」做，缓存 key 仍用原始 text，译文不串味。
+
+    以上全部是日语专用处理（口语缩约、日语规范化、片假名外来语、日语专名）。
+    音频语言不是日语时原样返回，避免把中文按日语规则改写；
+    英文路由同理只在日语源下启用（那是为了识别「日语直播里突然说英文」）。
     """
+    if source != "ja":
+        return text, source
     pro = text
     if getattr(cfg, "enable_zh_rules", False):
         # 缩略还原属于送翻前处理：只展开歧义小的口语形（っつー/すんの…）

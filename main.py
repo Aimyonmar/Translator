@@ -70,6 +70,12 @@ _setup_logging()
 _SERVER = None
 
 
+def lang_model_mismatch(cfg) -> bool:
+    """中文音频 + kotoba（日语专用档）会让解码失真，启动前必须拦住。"""
+    return (getattr(cfg, "source_lang", "ja") == "zh"
+            and "kotoba" in (getattr(cfg, "model_size", "") or ""))
+
+
 def _single_instance() -> bool:
     """只允许一个实例：重复双击会把已运行的窗口叫出来，而不是再起一个卡住的进程。"""
     global _SERVER
@@ -623,6 +629,16 @@ class AppController:
             self.panel.set_running(False)
             self.status("已停止")
         else:
+            # 中文音频不能走 kotoba（日语专用档会把中文强行按日语解码而失真）。
+            # 面板切换语言时已自动换模型；这里兜住手改 config.json、旧配置等情况。
+            if lang_model_mismatch(self.cfg):
+                QMessageBox.warning(
+                    self.panel, "模型与音频语言不匹配",
+                    "当前音频语言是中文，但识别模型是 kotoba-whisper-v2.0"
+                    "（日语专用）。用它解码中文会失真。\n\n"
+                    "请先到「识别」页把模型换成 small / large-v3-turbo / "
+                    "large-v3，再开始翻译。")
+                return
             self.pipeline.start()
             self.panel.set_running(True)
             self.overlay.show()
