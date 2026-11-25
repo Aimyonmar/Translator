@@ -19,6 +19,17 @@ import numpy as np
 
 TARGET_SR = 16000
 
+# 采集源：loopback = 电脑正在播放的系统声音（WASAPI 回环）；
+# mic = 电脑麦克风输入（说话声、现场人声）。两条源共用同一条识别/翻译链路。
+CAPTURE_SOURCES = ("loopback", "mic")
+CAPTURE_LABELS = {"loopback": "系统声音", "mic": "麦克风"}
+
+
+def normalize_source(source) -> str:
+    """把配置/界面传入的采集源收敛成 loopback | mic，未知值按系统声音处理。"""
+    s = str(source or "").strip().lower()
+    return "mic" if s in ("mic", "microphone", "麦克风") else "loopback"
+
 
 # ---------------------------------------------------------------- 重采样
 def resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -172,8 +183,69 @@ def _pw_devices() -> List[AudioDevice]:
     return out
 
 
-def list_capture_devices() -> List[AudioDevice]:
-    """返回去重后的采集设备列表，系统声音优先排在前面。"""
+def _mic_default_index() -> Optional[int]:
+    """sounddevice 的默认输入设备下标（不是回环）。
+
+    sd.default.device 是 _InputOutputPair（不是 tuple/list），必须用下标取，
+    直接 int() 会抛 TypeError —— 那会让「默认麦克风」永远标记不上。
+    """
+    try:
+        import sounddevice as sd
+        cur = sd.default.device
+        first = cur[0] if hasattr(cur, "__getitem__") else cur
+        return None if first is None else int(first)
+    except Exception:
+        return None
+
+
+def _mic_devices() -> List[AudioDevice]:
+    """麦克风列表：只取 sounddevice 的 input 条目，回环条目不算麦克风。
+
+    这里不混入 pyaudiowpatch：它只枚举 WASAPI 回环，麦克风用 sounddevice
+    的 InputStream 打开即可，少一条后端分支。
+    """
+    devs = [d for d in _sd_devices() if d.kind == "input"]
+    if not devs:
+        return []
+    dflt = _mic_default_index()
+    # 部分驱动（WDM-KS / 立体声混音）把「扬声器」也暴露成输入通道，
+    # 这类条目在麦克风模式下选中只会录到系统声音，直接排除。
+    _not_mic = ("扬声器", "speaker", "stereo mix", "立体声混音", "wave out", "output")
+    devs = [d for d in devs if not any(k in d.name.lower() for k in _not_mic)]
+    if not devs:
+        return []
+    for d in devs:
+        d.is_default = d.index is not None and d.index == dflt
+    # 去重：同一支麦克风在 MME/DS/WASAPI 下会重复出现，保留名字相同里最稳的那条。
+    # 麦克风优先 MME/DirectSound：WASAPI 在某些摄像头麦克风上从工作线程 start 会
+    # 报 -9999（WdmSyncIoctl），MME 对线程/采样率都更宽容，延迟也够实时字幕用。
+    def _api_rank(x: AudioDevice) -> int:
+        api = (x.api or "").lower()
+        if "mme" in api:
+            return 0
+        if "directsound" in api:
+            return 1
+        if "wasapi" in api:
+            return 2
+        if "wdm-ks" in api:
+            return 3
+        return 4
+
+    out: List[AudioDevice] = []
+    seen = set()
+    for d in sorted(devs, key=lambda x: (0 if x.is_default else 1, _api_rank(x), x.name)):
+        key = d.name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
+def list_capture_devices(source: str = "loopback") -> List[AudioDevice]:
+    """按采集源返回去重后的设备列表；系统声音优先排在前面。"""
+    if normalize_source(source) == "mic":
+        return _mic_devices()
     devices: List[AudioDevice] = []
     seen = set()
     for dev in _sd_devices() + _pw_devices():
@@ -192,7 +264,13 @@ def list_capture_devices() -> List[AudioDevice]:
     return devices
 
 
-def pick_default_device() -> Optional[AudioDevice]:
+def pick_default_device(source: str = "loopback") -> Optional[AudioDevice]:
+    if normalize_source(source) == "mic":
+        devs = _mic_devices()
+        for dev in devs:
+            if dev.is_default:
+                return dev
+        return devs[0] if devs else None
     devs = list_capture_devices()
     for dev in devs:
         if dev.kind == "loopback" and dev.is_default:
@@ -324,21 +402,62 @@ class AudioCapture:
         dev = self.device
         idx = dev.index if dev.index is not None else None
         last_err = None
+        # 采样率与声道都要试：麦克风多为单声道，摄像头麦克风的 WASAPI 立体声
+        # 还会在 start 时报 -9999，所以麦克风优先单声道。sr=None 用设备默认采样率。
+        if getattr(dev, "kind", "") == "input":
+            chans = [1] if dev.channels <= 1 else [1, dev.channels]
+        else:
+            chans = [dev.channels] if dev.channels <= 1 else [dev.channels, 1]
+        combos = [(sr, ch) for ch in chans
+                  for sr in (None, dev.samplerate, 48000, 44100, TARGET_SR)]
+        # 同一支麦克风在别的 host API 下往往还能打开（MME/DirectSound 对线程更宽容），
+        # 全部组合都失败时按同名设备再兜底一轮，避免「默认麦克风打不开就彻底没声」。
+        alts = []
+        if getattr(dev, "kind", "") == "input":
+            key = dev.name.strip().lower()
+            try:
+                alts = [d for d in _sd_devices()
+                        if d.kind == "input" and d.index != idx
+                        and d.name.strip().lower() == key]
+            except Exception:
+                alts = []
+        for alt in alts:
+            combos.append(None)          # 占位，稍后按 alt 逐个尝试
+        seen = set()
         try:
-            for sr in (None, dev.samplerate, 48000, 44100, TARGET_SR):
+            alt_i = 0
+            for item in combos:
                 if not self._running:
                     break
+                if item is None:
+                    alt = alts[alt_i]
+                    alt_i += 1
+                    sr = None
+                    ch = 1
+                    use_idx = alt.index
+                else:
+                    sr, ch = item
+                    if (sr, ch) in seen:
+                        continue
+                    seen.add((sr, ch))
+                    use_idx = idx
                 try:
                     kwargs = dict(samplerate=sr, blocksize=self.blocksize, dtype="float32",
-                                  channels=dev.channels, callback=self._sd_callback, latency="low")
-                    if idx is not None:
-                        kwargs["device"] = idx
+                                  channels=ch, callback=self._sd_callback, latency="low")
+                    if use_idx is not None:
+                        kwargs["device"] = use_idx
                     self._stream = sd.InputStream(**kwargs)
+                    # sr=None 时用设备默认采样率，回调里必须按实际值重采样，
+                    # 否则 48k 的麦克风会被当成 16k 直接送进 VAD（声音快 3 倍）。
+                    try:
+                        self._sd_sr = int(round(self._stream.samplerate)) if sr is None else int(sr)
+                    except Exception:
+                        self._sd_sr = int(sr or TARGET_SR)
                     self._stream.start()
                     while self._running:
                         time.sleep(0.2)
                     return
-                except Exception as exc:      # 换采样率重试
+                except Exception as exc:      # 换采样率/声道/后端重试
                     last_err = exc
                     try:
                         if self._stream is not None:
@@ -385,7 +504,8 @@ class AudioCapture:
         if not self._running:
             return
         try:
-            self._push(self._pre_mono(np.asarray(indata, dtype=np.float32).copy()), TARGET_SR)
+            self._push(self._pre_mono(np.asarray(indata, dtype=np.float32).copy()),
+                       int(getattr(self, "_sd_sr", TARGET_SR)))
         except Exception:
             pass
 

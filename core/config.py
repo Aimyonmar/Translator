@@ -45,6 +45,9 @@ def _clamp(value: Any, lo, hi, cast):
 class AppConfig:
     # 音频
     device: Optional[Dict[str, Any]] = None
+    # 采集源：loopback = 电脑正在播放的系统声音（默认，直播/游戏）；mic = 麦克风输入。
+    # 两条源共用同一套识别/翻译/上屏链路，识别语言仍由顶栏三档决定。
+    capture_source: str = "loopback"
     # 识别
     model_size: str = "small"
     asr_device: str = "auto"
@@ -292,6 +295,7 @@ class AppConfig:
 
     _STR_FIELDS = (
         "model_size", "asr_device", "compute_type", "source_lang", "channel", "target_lang",
+        "capture_source",
         "custom_type", "custom_key", "custom_base", "custom_model", "caiyun_token",
         "last_channel", "word_map", "name_roster", "proxy", "context_glossary",
         "transcribe_dir", "export_dir", "translate_glossary",
@@ -313,6 +317,8 @@ class AppConfig:
                 setattr(self, name, "")
         if not isinstance(self.device, dict):
             self.device = None
+        if self.capture_source not in ("loopback", "mic"):
+            self.capture_source = "loopback"
         if not isinstance(self.geometry, dict):
             self.geometry = None
         if not self.target_lang:

@@ -13,7 +13,8 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 
-from .audio import AudioCapture, AudioDevice, TARGET_SR, pick_default_device
+from .audio import (AudioCapture, AudioDevice, TARGET_SR, pick_default_device,
+                    CAPTURE_LABELS, normalize_source)
 from .asr import WhisperASR
 from .config import AppConfig
 from .context import ContextBuffer, fix_homophones, fix_translation
@@ -179,22 +180,32 @@ class Pipeline:
             self.translator.probe()
         threading.Thread(target=probe_all, daemon=True).start()
         try:
+            source = self.capture_source()
             dev = AudioDevice.from_dict(self.cfg.device) if self.cfg.device else None
-            # 保存的设备当时是「系统默认播放设备的回环」→ 默认设备可能已经换了
-            # （插耳机/拔音箱/切蓝牙）。跟着系统默认走，避免「声音从耳机出、
-            # 却还在抓扬声器」——那会表现为有声音但一个字都不出
-            # （WASAPI 回环对没在播放的设备根本不产生回调）。
+            # 换了采集源（系统声音 ↔ 麦克风）后，旧设备不属于当前源：直接按新源重挑
+            if not self.device_matches_source(dev, source):
+                dev = None
+            # 保存的设备当时是「系统默认设备的回环/麦克风」→ 默认设备可能已经换了
+            # （插耳机/拔音箱/切蓝牙/换 USB 麦克风）。跟着系统默认走，避免
+            # 「声音从耳机出、却还在抓扬声器」——那会表现为有声音但一个字都不出
+            # （WASAPI 回环对没在播放的设备根本不产生回调）；麦克风同理，
+            # 换了默认输入后旧设备可能已拔出。
             if dev is None or dev.is_default:
-                cur = pick_default_device()
+                cur = pick_default_device(source)
                 if cur is not None and (dev is None or (cur.name, cur.backend) != (dev.name, dev.backend)):
                     if dev is not None:
-                        self.on_status(f"默认声音设备已切换为「{cur.name}」，采集已自动跟随")
+                        self.on_status(f"默认{CAPTURE_LABELS[source]}设备已切换为「{cur.name}」，采集已自动跟随")
                     self.cfg.device = cur.to_dict()
                     try:
                         self.cfg.save()
                     except Exception:
                         pass
                 dev = cur if cur is not None else dev
+            if dev is None:
+                self.state = "error"
+                self.on_status(f"没有找到可用的{CAPTURE_LABELS[source]}设备，"
+                               "请在「设备」页刷新并改选")
+                return
             cap = self._new_capture(dev)
             cap.start()
             time.sleep(0.4)
@@ -221,7 +232,7 @@ class Pipeline:
             return
         self.state = "running"
         self._cap_restarts = 0
-        self.on_status(f"正在聆听…（{self.route_summary()}）")
+        self.on_status(f"正在聆听…（{self.route_summary()} · {CAPTURE_LABELS[self.capture_source()]}）")
         # 采集 1 路、识别 1 路（GPU 很快）、翻译 2 路并发。
         # 并发别开太高：免费 MyMemory 会限流，开 4 路反而把请求拖到十几秒。
         for fn, n in ((self._capture_loop, 1), (self._asr_loop, 1), (self._trans_loop, 2)):
@@ -269,7 +280,7 @@ class Pipeline:
                     self.on_status(f"恢复采集失败：{exc}")
                     return
             self.state = "running"
-            self.on_status("正在聆听…（系统声音）")
+            self.on_status(f"正在聆听…（{CAPTURE_LABELS[self.capture_source()]}）")
 
     # ------------------------------------------------------------ 标错
     def recent_sentence(self, back: int = 0) -> Optional[dict]:
@@ -299,12 +310,35 @@ class Pipeline:
         try:
             if self.capture:
                 self.capture.stop()
+            source = self.capture_source()
             dev = AudioDevice.from_dict(self.cfg.device) if self.cfg.device else None
+            if not self.device_matches_source(dev, source):
+                dev = pick_default_device(source)
+                if dev is not None:
+                    self.cfg.device = dev.to_dict()
+            if dev is None:
+                self.capture = None
+                self.on_status(f"没有找到可用的{CAPTURE_LABELS[source]}设备，"
+                               "请在「设备」页刷新并改选")
+                return
             self.capture = self._new_capture(dev)
             if self.state == "running":
                 self.capture.start()
         except Exception as exc:
             self.on_status(f"切换音频设备失败：{exc}")
+
+    def capture_source(self) -> str:
+        """当前采集源：loopback（系统声音）| mic（麦克风）。"""
+        return normalize_source(getattr(self.cfg, "capture_source", "loopback"))
+
+    @staticmethod
+    def device_matches_source(dev, source: str) -> bool:
+        """保存的设备是否属于该采集源：麦克风只看 input，系统声音看回环/扬声器。"""
+        if dev is None:
+            return False
+        if normalize_source(source) == "mic":
+            return getattr(dev, "kind", "") == "input"
+        return getattr(dev, "kind", "") in ("loopback", "output")
 
     def _default_device_changed(self) -> bool:
         """系统默认回环设备是否已不等于当前采集设备（用于区分「断流」与「空闲静音」）。
@@ -317,7 +351,7 @@ class Pipeline:
             return False
         self._dev_check_ts = now
         try:
-            cur = pick_default_device()
+            cur = pick_default_device(self.capture_source())
         except Exception:
             return False
         if cur is None or self.capture is None:
@@ -335,16 +369,19 @@ class Pipeline:
         except Exception:
             pass
         try:
+            source = self.capture_source()
             dev = AudioDevice.from_dict(self.cfg.device) if self.cfg.device else None
-            # 保存的是「跟随系统默认」的回环时，必须先重新挑当前默认设备：
-            # 插耳机/切蓝牙后默认输出已经变了，旧扬声器回环虽然还能打开，
+            if not self.device_matches_source(dev, source):
+                dev = None
+            # 保存的是「跟随系统默认」的回环/麦克风时，必须先重新挑当前默认设备：
+            # 插耳机/切蓝牙/换 USB 麦克风后默认设备已经变了，旧设备虽然还能打开，
             # 但那边没有声音、永远不会有回调，一直重开它就会「有声音、没字幕」。
             # 手动选定的具体设备（is_default=False）保持不动，尊重用户选择。
             if dev is None or dev.is_default:
-                cur = pick_default_device()
+                cur = pick_default_device(source)
                 if cur is not None and (dev is None or (cur.name, cur.backend) != (dev.name, dev.backend)):
                     if dev is not None:
-                        self.on_status(f"默认声音设备已切换为「{cur.name}」，采集已自动跟随")
+                        self.on_status(f"默认{CAPTURE_LABELS[source]}设备已切换为「{cur.name}」，采集已自动跟随")
                     dev = cur
                     self.cfg.device = cur.to_dict()
                     try:
@@ -356,7 +393,7 @@ class Pipeline:
             time.sleep(0.5)
             if new.error:
                 new.stop()
-                d = pick_default_device()
+                d = pick_default_device(source)
                 if d is None:
                     self.on_status("自动恢复失败：找不到可用的采集设备，请手动刷新设备列表")
                     return
@@ -428,10 +465,16 @@ class Pipeline:
             pass
 
     def _new_capture(self, dev) -> AudioCapture:
-        """统一构造采集实例：带上采集期参数（人声提取开关/强度）。"""
+        """统一构造采集实例：带上采集期参数（人声提取开关/强度）。
+
+        中置人声提取只对立体声回环有意义；麦克风是单人近场输入，开它只会
+        把主声道当 BGM 压掉，所以麦克风源强制关闭。
+        """
+        use_vocal = (self.capture_source() == "loopback"
+                     and bool(getattr(self.cfg, "vocal_extract", True)))
         return AudioCapture(
             dev,
-            vocal_extract=bool(getattr(self.cfg, "vocal_extract", True)),
+            vocal_extract=use_vocal,
             vocal_strength=float(getattr(self.cfg, "vocal_strength", 0.8)),
         )
 
@@ -499,6 +542,9 @@ class Pipeline:
                 warned = True
                 if cap.error:
                     self.on_status(f"音频采集不可用：{cap.error}（请在「采集设备」里刷新后改选）")
+                elif self.capture_source() == "mic":
+                    self.on_status("麦克风一直没有数据 —— 请确认麦克风没被静音/占用，"
+                                   "并在「采集设备」里刷新后改选其它 [麦克风]")
                 else:
                     self.on_status("采集设备一直没有数据 —— 若刚插了耳机/切了蓝牙，"
                                    "请在「采集设备」里刷新并改选耳机对应的 [系统声音]")
@@ -513,8 +559,12 @@ class Pipeline:
             peak = max(peak, level)
             if not warned and time.time() - started > 15 and peak < 0.002:
                 warned = True
-                self.on_status("一直没抓到声音 —— 请在「采集设备」里换一个 [系统声音] 设备试试"
-                               "（你现在出声的可能是耳机或外接音箱）")
+                if self.capture_source() == "mic":
+                    self.on_status("一直没抓到声音 —— 请在「采集设备」里换一个 [麦克风]，"
+                                   "并确认系统输入音量不是 0")
+                else:
+                    self.on_status("一直没抓到声音 —— 请在「采集设备」里换一个 [系统声音] 设备试试"
+                                   "（你现在出声的可能是耳机或外接音箱）")
             now = time.time()
             if now - last_level_post > 0.08:
                 last_level_post = now

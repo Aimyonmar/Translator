@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from core import feedback, model_store, lang_mode
 from core.asr import MODEL_SIZES
+from core.audio import CAPTURE_LABELS, normalize_source
 from ui.global_hotkey import DEFAULT_HOTKEY, GlobalHotkey, parse_hotkey
 from core.translator import CHANNELS, CHANNEL_NAMES, LANGS
 from ui import theme
@@ -257,7 +258,7 @@ class ControlPanel(QWidget):
         lbl_vol.setObjectName("hint")
         self.lbl_route = QLabel(lang_mode.route_text(self.cfg))
         self.lbl_route.setObjectName("hint")
-        self.lbl_route.setToolTip("当前实际路由：输入语言 → 译文 · 识别模型")
+        self.lbl_route.setToolTip("当前实际路由：采集源（麦克风时显示）· 输入语言 → 译文 · 识别模型")
         head.addWidget(self.lbl_counts)
         head.addWidget(self.lbl_state)
         head.addWidget(lbl_vol)
@@ -393,8 +394,29 @@ class ControlPanel(QWidget):
         page, root = self._page_shell()
 
         # 音频
-        box_audio = QGroupBox("音频输入（默认抓取电脑系统声音）")
+        box_audio = QGroupBox("音频输入（系统声音 / 麦克风）")
         f = QFormLayout(box_audio)
+        # 采集源：系统声音 = 电脑正在播放的内容；麦克风 = 电脑话筒。
+        # 识别语言不在这里选，仍由顶栏三档决定，换源只影响声音来源。
+        self._src_group = QButtonGroup(self)
+        self._src_group.setExclusive(True)
+        self._src_btns = {}
+        row_src = QHBoxLayout()
+        row_src.setSpacing(6)
+        for key in ("loopback", "mic"):
+            btn = QPushButton(CAPTURE_LABELS[key])
+            btn.setCheckable(True)
+            btn.setFixedHeight(28)
+            btn.setToolTip(
+                "抓取电脑正在播放的声音（直播/游戏/视频），翻译内容以顶栏输入语言为准"
+                if key == "loopback" else
+                "抓取电脑麦克风输入（自己的说话声），识别语言同样跟随顶栏三档")
+            btn.clicked.connect(lambda _c=False, k=key: self._set_capture_source(k))
+            self._src_group.addButton(btn)
+            self._src_btns[key] = btn
+            row_src.addWidget(btn)
+        row_src.addStretch(1)
+        f.addRow("采集源", row_src)
         self.cmb_device = QComboBox()
         self.cmb_device.setMinimumWidth(300)
         self.btn_refresh = QPushButton("刷新设备")
@@ -404,6 +426,11 @@ class ControlPanel(QWidget):
         row.addWidget(self.btn_refresh)
         f.addRow("采集设备", row)
         self.cmb_device.currentIndexChanged.connect(self._on_device_changed)
+        lbl_mic_hint = QLabel("麦克风模式抓电脑话筒（自己的说话声）；识别语言仍由顶栏三档决定。")
+        lbl_mic_hint.setObjectName("hint")
+        lbl_mic_hint.setWordWrap(True)
+        f.addRow("", lbl_mic_hint)
+        self._sync_capture_ui()
         root.addWidget(box_audio)
 
         # 识别模型：用哪份权重、跑在哪个运算设备上
@@ -1200,9 +1227,33 @@ class ControlPanel(QWidget):
             btn.setChecked(key == mode)
             btn.blockSignals(False)
 
+    def _sync_capture_ui(self) -> None:
+        """采集源按钮跟随配置：从任何入口改完都指向同一源。"""
+        if not getattr(self, "_src_btns", None):
+            return
+        cur = normalize_source(getattr(self.cfg, "capture_source", "loopback"))
+        for key, btn in self._src_btns.items():
+            btn.blockSignals(True)
+            btn.setChecked(key == cur)
+            btn.blockSignals(False)
+
+    def _set_capture_source(self, source: str) -> None:
+        """切换采集源：设备列表、采集流立刻跟着换；识别语言不变。"""
+        src = normalize_source(source)
+        if src == normalize_source(getattr(self.cfg, "capture_source", "loopback")):
+            self._sync_capture_ui()
+            return
+        self.ctrl.on_capture_source_changed(src)
+        self._sync_capture_ui()
+        self._refresh_route()
+        self._log(f"采集源：{CAPTURE_LABELS[src]}")
+
     def _refresh_route(self) -> None:
         if hasattr(self, "lbl_route"):
-            self.lbl_route.setText(lang_mode.route_text(self.cfg))
+            txt = lang_mode.route_text(self.cfg)
+            if normalize_source(getattr(self.cfg, "capture_source", "loopback")) == "mic":
+                txt = "麦克风 · " + txt
+            self.lbl_route.setText(txt)
 
     def _set_input_mode(self, mode: str) -> list:
         """切换输入语言：源语言、模型、目标语言一次到位，并立刻生效。"""

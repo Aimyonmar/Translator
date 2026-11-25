@@ -461,7 +461,7 @@ def run_once(args, corpus: dict, recorder: Recorder, replay: bool) -> dict:
     cap = FakeCapture(audio, paced=not replay)
     pipe._new_capture = lambda dev: cap
     import core.pipeline as pipe_mod
-    pipe_mod.pick_default_device = lambda: None
+    pipe_mod.pick_default_device = lambda *a, **k: None
 
     finals = []
     calls = []

@@ -110,7 +110,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core import feedback
-from core.audio import list_capture_devices, pick_default_device
+from core.audio import list_capture_devices, pick_default_device, CAPTURE_LABELS, normalize_source
 from core.config import AppConfig
 from core.pipeline import Pipeline
 from core.transcribe import resplit, transcribe_media, translate_segments
@@ -248,22 +248,46 @@ class AppController:
     def refresh_devices(self) -> None:
         def work():
             try:
-                devs = list_capture_devices()
+                source = normalize_source(getattr(self.cfg, "capture_source", "loopback"))
+                devs = list_capture_devices(source)
                 cur = None
                 if self.cfg.device:
                     from core.audio import AudioDevice
                     cur = AudioDevice.from_dict(self.cfg.device)
+                    # 采集源换过之后，旧设备不属于当前源，不能拿来当「当前设备」
+                    if cur is not None and not self.pipeline.device_matches_source(cur, source):
+                        cur = None
                 if cur is None:
-                    cur = pick_default_device()
+                    cur = pick_default_device(source)
                     if cur is not None:
                         self.cfg.device = cur.to_dict()
                         self.cfg.save()
                 # 控件只能由主线程操作：工作线程通过信号投递，别直接调 panel.set_devices
                 self.panel.sig_devices.emit(devs, cur)
-                self.status(f"发现 {len(devs)} 个音频设备，当前：{cur.label if cur else '无'}")
+                self.status(f"发现 {len(devs)} 个{CAPTURE_LABELS[source]}设备，当前：{cur.label if cur else '无'}")
             except Exception as exc:
                 self.status(f"枚举音频设备失败：{exc}")
         threading.Thread(target=work, daemon=True).start()
+
+    def on_capture_source_changed(self, source: str) -> None:
+        """切换采集源（系统声音 ↔ 麦克风）：换设备、存盘，运行中立即重开采集。
+
+        识别语言不在这里改 —— 仍由顶栏三档决定，换源只影响「声音从哪来」。
+        """
+        src = normalize_source(source)
+        if src == normalize_source(getattr(self.cfg, "capture_source", "loopback")):
+            return
+        self.cfg.capture_source = src
+        from core.audio import AudioDevice
+        dev = AudioDevice.from_dict(self.cfg.device) if self.cfg.device else None
+        if not self.pipeline.device_matches_source(dev, src):
+            dev = pick_default_device(src)
+            self.cfg.device = dev.to_dict() if dev is not None else None
+        self.cfg.save()
+        self.refresh_devices()
+        self.pipeline.restart_audio()
+        self.status(f"采集源已切换：{CAPTURE_LABELS[src]}" +
+                    (f"（{dev.label}）" if dev is not None else "（未找到可用设备）"))
 
     def on_device_selected(self, dev) -> None:
         self.cfg.device = dev.to_dict()
