@@ -8,7 +8,7 @@ CHANNELS = ["auto", "custom", "tencent", "caiyun", "mymemory", "edge", "google",
 CHANNEL_NAMES = {"auto": "自动", "custom": "自定义 API", "tencent": "腾讯翻译君",
                  "caiyun": "彩云小译", "edge": "Edge·必应",
                  "google": "Google", "deepl": "DeepL 网页", "mymemory": "MyMemory",
-                 "llm": "LLM 质量通道"}
+                 "llm": "LLM 质量通道", "memory": "短语记忆"}
 
 # 国内实测（2026-10）：腾讯 217ms / 彩云 715ms / MyMemory 831ms，
 # 且口语准确率 彩云 > 腾讯 > MyMemory。默认把最快、也够用的腾讯排前面。

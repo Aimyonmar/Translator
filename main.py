@@ -478,6 +478,8 @@ class AppController:
                     self.panel.sig_trs_status.emit(f"正在翻译 {i}/{n} 句…")
 
             t1 = time.perf_counter()
+            # 短语记忆按文件隔离：同一个视频里重复句/称呼零延迟且译法一致
+            self.pipeline.translator.clear_memory()
             ok = translate_segments(
                 self.pipeline.translator, segments,
                 roster=self.cfg.name_roster if namefix else "",

@@ -22,6 +22,7 @@ from .channels import postprocess, preprocess, racing
 from .channels.constants import (CHANNELS, CHANNEL_NAMES, COLLOQUIAL_ORDER, FREE_ORDER,
                                  LANG_NAME_BY_CODE, LANGS, PROXY_PORTS, UA)
 from .channels.keepalive import Keepalive
+from .phrase_memory import PhraseMemory
 from .phrases import is_colloquial, lookup as phrase_lookup
 
 
@@ -60,6 +61,9 @@ class Translator:
         # 与网络异常的 fail_count 分开：这里能看出哪个通道在污染译文，
         # 例如 DeepL 免费接口返回旧版停用提示。
         self.channel_fails: dict = {}
+        # 会话级短语记忆：同一场直播/同一个文件里重复句、称呼、固定表达
+        # 直接命中，零延迟且译法完全一致；由调用方在开始新一轮时清空。
+        self.memory = PhraseMemory()
         self.route_log: list = []
         # 最近一条字幕命中的译后规则（供诊断/面板展示，不影响翻译）
         self.last_rule_hits: list = []
@@ -204,6 +208,12 @@ class Translator:
         self._tls.channel = ""
         # 本句的主备赛跑结果（是否备胎救回、晚到多少、谁胜出），没走主备时为 None
         self._tls.hedge = None
+        # 会话短语记忆优先：重复句/称呼/固定表达零延迟，且同一集内译法一致。
+        # 放在上下文拼装之前，命中连本地预处理都不做。
+        hit = self.memory.get(text, self.source, self.target)
+        if hit is not None:
+            self._tls.channel = "memory"
+            return hit
         # 上下文块在本地拼装（<0.1ms）：只有能接受 system prompt 的 custom 通道用得上
         ctx_block, free_ctx = preprocess.build_context(
             self.cfg, context, self._custom_ready() or self._llm_ready())
@@ -325,6 +335,7 @@ class Translator:
             if rule_hits:
                 self.last_rule_hits = rule_hits
             with self.lock:
+                self.memory.put(text, out, self.source, self.target)
                 self._cache[cache_key] = out
                 if len(self._cache) > 800:
                     self._cache.popitem(last=False)
@@ -562,6 +573,10 @@ class Translator:
     def clear_cache(self) -> None:
         with self.lock:
             self._cache.clear()
+
+    def clear_memory(self) -> None:
+        """开新一轮（新直播场次 / 新转写文件）时清空短语记忆，避免跨集串译法。"""
+        self.memory.clear()
 
     def last_channel(self) -> str:
         """当前线程最近一次 translate 实际用到（或拿到响应）的通道，仅诊断用。"""

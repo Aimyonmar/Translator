@@ -105,6 +105,8 @@ class Pipeline:
             self._next_seq = 0
         # 新一场直播：上一场的句子不能当这一场的语境
         self.context.clear()
+        # 短语记忆也按场次隔离：上一集的称呼/译法不能带进新一集
+        self.translator.clear_memory()
         # 标错会话：每次开始换新 id，旧句子不再出现在可标记窗口里
         self.session_id = feedback.new_session_id("live")
         self._session_t0 = time.time()
