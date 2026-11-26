@@ -199,28 +199,98 @@ def remove(size: str) -> int:
     return freed
 
 
+def _hub_constants():
+    """已导入的 huggingface_hub 常量模块；没导入过返回 None。"""
+    try:
+        from huggingface_hub import constants
+        return constants
+    except Exception:
+        return None
+
+
+def set_offline(flag: bool) -> None:
+    """同时改环境变量和已导入的 hub 常量：hub 只在 import 时读一次环境变量。
+
+    asr 加载本地缓存时会把 HF_HUB_OFFLINE 置 1 让加载不联网；但此时 hub 已经
+    导入，`constants.HF_HUB_OFFLINE` 被冻结成 True。之后面板点「下载」即使
+    删掉环境变量，snapshot_download 仍按离线直接报
+    LocalEntryNotFoundError（outgoing traffic has been disabled）——这就是
+    「界面下载必失败、准备模型.py 却能下」的根因。
+    """
+    os.environ["HF_HUB_OFFLINE"] = "1" if flag else "0"
+    consts = _hub_constants()
+    if consts is not None:
+        try:
+            consts.HF_HUB_OFFLINE = bool(flag)
+        except Exception:
+            pass
+
+
+def _download_error(exc: Exception, size: str, repo: str) -> str:
+    """把下载异常翻成可操作的中文原因，原始信息原样保留。"""
+    text = str(exc)
+    low = text.lower()
+    if "offline" in low or "outgoing traffic" in low:
+        hint = "程序仍被判定为离线模式（hub 只在启动时读一次离线开关），请重启程序后重试"
+    elif "401" in text or "403" in text or "unauthorized" in low or "forbidden" in low:
+        hint = f"镜像拒绝了请求（鉴权/限流）：可设 HF_TOKEN，或换下载源 HF_ENDPOINT=https://huggingface.co"
+    elif "404" in text:
+        hint = f"仓库 {repo} 不存在或镜像还没同步，请换下载源或稍后重试"
+    elif "timed out" in low or "timeout" in low:
+        hint = "连接超时：网络不通或代理没生效，可设置 HTTPS_PROXY 后重试"
+    elif "ssl" in low or "certificate" in low:
+        hint = "证书校验失败：检查系统时间/杀毒软件 HTTPS 扫描，或换网络重试"
+    elif "getaddrinfo" in low or "name or service not known" in low or "dns" in low:
+        hint = "域名解析失败：先确认能打开 https://hf-mirror.com，再查 DNS/代理"
+    elif "proxy" in low:
+        hint = "代理不可用：确认代理端口与 HTTPS_PROXY 设置"
+    elif "no space" in low or "errno 28" in low:
+        hint = "磁盘空间不足：清理 .runtime/hf 或换到空间更大的盘"
+    else:
+        hint = "网络或下载源异常，可重试；仍失败换源：set HF_ENDPOINT=https://huggingface.co"
+    return (f"下载模型 {size}（{repo}）失败：{hint}\n"
+            f"原始错误：{type(exc).__name__}: {text}")
+
+
 def download(size: str, progress: Optional[Callable[[str], None]] = None) -> str:
     """下载指定模型；已完整存在时直接返回，不联网。"""
     if is_downloaded(size):
         return snapshot_dir(size) or ""
 
-    os.environ["HF_HOME"] = cache_root()
+    root = cache_root()
+    os.makedirs(root, exist_ok=True)
+    os.environ["HF_HOME"] = root
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-    # asr 加载旧模型时会置 HF_HUB_OFFLINE=1；不清掉的话本次下载会直接按离线失败
-    os.environ.pop("HF_HUB_OFFLINE", None)
+    # 关键：asr 加载缓存模型时把离线开关置过 1，hub 常量已冻结；
+    # 只删环境变量不够，必须同时把常量改回在线。
+    set_offline(False)
+
+    # 下载前先看磁盘：几百 MB~3 GB 的写入，空间不够会下到一半才报错
+    try:
+        free = shutil.disk_usage(root).free
+        need = EST_SIZE_MB.get(size, 1000) * 1024 * 1024 * 2
+        if free < need:
+            raise RuntimeError(
+                f"磁盘空间不足：{root} 所在盘剩余 {free / 1024 ** 3:.1f} GB，"
+                f"下载 {size} 至少需要约 {need / 1024 ** 3:.1f} GB")
+    except OSError:
+        pass
 
     from huggingface_hub import snapshot_download
 
     repo = repo_id(size)
     if progress:
         progress(f"开始下载 {size}（约 {EST_SIZE_MB.get(size, 0)} MB）…")
-    snapshot_download(repo)
+    try:
+        snapshot_download(repo)
+    except Exception as exc:
+        raise RuntimeError(_download_error(exc, size, repo)) from exc
     if not is_downloaded(size):
         raise RuntimeError("下载结束但缓存文件不完整，请重试或检查磁盘空间")
 
-    # 下载完立刻清掉离线标记，否则本次会话仍会按“没网”加载
-    os.environ.pop("HF_HUB_OFFLINE", None)
+    # 下载完保持在线：本次会话还能继续下别的模型，加载时 asr 会自己切回离线
+    set_offline(False)
     if progress:
         progress(f"{size} 下载完成")
     return snapshot_dir(size) or ""

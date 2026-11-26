@@ -35,7 +35,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 # 模型仓库体积（MB）与缓存判定统一由 core.model_store 提供：面板、asr、
 # 本脚本共用一套，避免两处表各写一份、越走越偏
-from core.model_store import EST_SIZE_MB as SIZE_MB, repo_id, snapshot_dir
+from core.model_store import EST_SIZE_MB as SIZE_MB, repo_id, snapshot_dir, set_offline
 
 
 def _pick_model() -> str:
@@ -122,6 +122,9 @@ def main() -> int:
     print("开始下载（进度条为已下载文件数与总量，网络中断可以重新运行本脚本续传）…")
     print()
     t0 = time.time()
+    # 继承来的 HF_HUB_OFFLINE=1（例如从上次失败的调试窗口里带过来）会让
+    # snapshot_download 直接按离线失败，这里统一切回在线。
+    set_offline(False)
     try:
         path = snapshot_download(repo)
     except KeyboardInterrupt:

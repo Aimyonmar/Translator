@@ -215,9 +215,11 @@ class WhisperASR:
             # 必须两个分支都写：只在命中缓存时置 1 的话，切到未缓存的新模型时
             # 这个环境变量还粘着，下载会被永久拦住，只能重启程序才能恢复。
             if self._cached():
-                os.environ["HF_HUB_OFFLINE"] = "1"
+                from .model_store import set_offline
+                set_offline(True)
             else:
-                os.environ.pop("HF_HUB_OFFLINE", None)
+                from .model_store import set_offline
+                set_offline(False)
 
             dev = self.device
             if dev == "auto":
