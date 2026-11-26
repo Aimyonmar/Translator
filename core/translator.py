@@ -56,6 +56,10 @@ class Translator:
         # 请求/失败计数与每条线路的实测往返，只用于 A/B 统计
         self.req_count = 0
         self.fail_count = 0
+        # 每条通道「返回了内容但被判无效」的次数（HTML/提示页/语言不符等）。
+        # 与网络异常的 fail_count 分开：这里能看出哪个通道在污染译文，
+        # 例如 DeepL 免费接口返回旧版停用提示。
+        self.channel_fails: dict = {}
         self.route_log: list = []
         # 最近一条字幕命中的译后规则（供诊断/面板展示，不影响翻译）
         self.last_rule_hits: list = []
@@ -274,6 +278,12 @@ class Translator:
                 continue
             out = html.unescape(out.strip())
             self._tls.channel = ch
+            # 来源格式/内容校验：HTML 片段、翻译器提示页、多语言重复块、
+            # 长度比例异常、语言明显不符 —— 都不能当译文上屏。
+            bad = postprocess.invalid_reason(text, out, self.source, self.target)
+            if bad:
+                self._mark_bad(ch, bad, text)
+                continue
             # 免费通道语境护栏：请求里拼了一段前文，模型可能把前文一起翻出来，
             # 甚至整段改写成一句话。只认换行分段、只取最后一段（当前句）；
             # 切不开或长度明显超长就当作污染，用干净单句重发一次，拿不到就换通道。
@@ -293,6 +303,11 @@ class Translator:
                     out = html.unescape(plain.strip())
                 else:
                     out = seg
+                # 分段后可能只剩提示页的某一段（例如仅英文那句），再校验一次
+                bad = postprocess.invalid_reason(text, out, self.source, self.target)
+                if bad:
+                    self._mark_bad(ch, bad, text)
+                    continue
             # 上下文污染护栏：模型偶尔会把前文一起翻出来（字幕里出现两句以上），
             # 长度明显超出当前句就直接丢弃，让界面只显示原文
             if ctx_block and len(out) > max(60, len(text) * 3):
@@ -336,6 +351,23 @@ class Translator:
             self._gid += 1
             return self._gid
 
+    def _mark_bad(self, ch: str, reason: str, text: str = "") -> None:
+        """记一次「通道有返回，但内容不可用」：计入该通道的污染计数并写日志。
+
+        这类响应不是网络异常（HTTP 200、JSON 也合法），不能混进 fail_count，
+        否则看不出是通道在污染而不是网络抖动。
+        """
+        with self.lock:
+            self.channel_fails[ch] = self.channel_fails.get(ch, 0) + 1
+        self._say("通道 %s 返回无效译文（%s），已换下一通道%s"
+                  % (CHANNEL_NAMES.get(ch, ch), reason,
+                     ("：" + text[:16]) if text else ""))
+
+    def channel_fail_stats(self) -> dict:
+        """各通道内容污染次数快照（供诊断/面板查看）。"""
+        with self.lock:
+            return dict(self.channel_fails)
+
     def _timed_fire(self, ch: str, text: str, src: str = "ja", timeout: float = 4.0,
                     context: str = "", gid: int = 0) -> Optional[str]:
         """_fire + 记录这条线路的实际往返，供 A/B 统计（不影响正常路径）。"""
@@ -376,16 +408,28 @@ class Translator:
         """
         def work(ch):
             try:
-                return self._timed_fire(ch, text, src, timeout=timeout, gid=gid)
+                out = self._timed_fire(ch, text, src, timeout=timeout, gid=gid)
             except Exception:
                 # 与串行路径一致：确认不通就本次会话不再重试，否则主备模式会每句都
                 # 先撞一次同一个坏通道
                 with self.lock:
                     self._dead.add(ch)
                 return None
+            # 主备路径同样要做内容校验：备胎抢到的可能正是提示页/错误页，
+            # 不拦就会绕过串行通道的检查直接上屏。
+            if out:
+                bad = postprocess.invalid_reason(
+                    text, html.unescape(out.strip()), self.source, self.target)
+                if bad:
+                    self._mark_bad(ch, bad, text)
+                    return None
+            return out
 
         best, done_at, fired = racing.race(
-            chs, work, lambda out: not self._is_junk(text, out), timeout, delay_ms)
+            chs, work,
+            lambda out: (not self._is_junk(text, out)
+                         and not postprocess.is_invalid(text, out, self.source, self.target)),
+            timeout, delay_ms)
         # 上报口径：rescued=胜出的是备胎；late_ms=备胎完成比主通道完成晚多少（都拿到时刻才算，
         # 主通道超时/失败时没有参照，记 None）；winner=最终胜出通道。
         info = None
@@ -489,6 +533,9 @@ class Translator:
                 results.append((name, False, ms, "返回空"))
             elif self._is_junk(self.PROBE_TEXT, out):
                 results.append((name, False, ms, f"疑似乱码：{out.strip()[:20]}"))
+            elif postprocess.is_invalid(self.PROBE_TEXT, out, "ja", self.target):
+                results.append((name, False, ms,
+                                f"无效译文（{postprocess.invalid_reason(self.PROBE_TEXT, out, 'ja', self.target)}）"))
             else:
                 # 通道本身能通，但被前面某次失败拉黑了 —— 这类最容易误判成「译文消失」
                 extra = "（已被判不可用，重启或改设置会重试）" if ch in self._dead else ""
@@ -500,7 +547,8 @@ class Translator:
         for ch in self._order():
             try:
                 out = self._dispatch(ch, "こんにちは")
-                if out and out.strip():
+                if (out and out.strip()
+                        and not postprocess.is_invalid("こんにちは", out, "ja", self.target)):
                     self._active = ch
                     self._last_req = time.time()
                     self.start_keepalive()
