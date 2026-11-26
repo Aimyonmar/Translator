@@ -140,17 +140,30 @@ class Pipeline:
             # 失败多半是显存被游戏临时占满，重启后显存空了就该回 GPU。
             # load() 内部按显存余量自动选档并逐级降级，GPU 真不可用时
             # 几秒内就会落到可用组合，不会像以前那样白等。
-            # 加载竞态兜底：预热可能还在加载 kotoba 时用户就切到了中文，
-            # 实际加载的档与要用的档不一致就卸载重来一次，绝不拿日语档解中文。
-            for _try in range(2):
+            # 加载竞态兜底（两种都可能发生）：
+            # 1) 预热还在加载 kotoba 时用户切到了中文 —— 实际加载的档与要用的档
+            #    不一致，卸载重来，绝不拿日语档解非日语音频；
+            # 2) 加载期间用户在识别页换了模型 —— asr.load 入口记的是旧目标，
+            #    加载完必须按新目标再载一次，否则「选了却不生效」。
+            for _try in range(3):
+                want = self.cfg.model_size
                 self.asr.load(on_progress=self.on_status)
                 # 冷启动加载要十几秒，这期间用户可能已经点了停止
                 if aborted():
                     return
-                if not (getattr(self.asr, "_force_ja", False)
+                if (getattr(self.asr, "_force_ja", False)
                         and getattr(self.cfg, "source_lang", "ja") != "ja"):
-                    break
-                self.asr.unload()
+                    self.asr.unload()
+                    continue
+                if (want != self.cfg.model_size
+                        and getattr(self.asr, "_loaded_size", "") != self.cfg.model_size):
+                    # 加载期间换了模型：把新目标同步给识别器后重载
+                    self.asr.model_size = self.cfg.model_size
+                    self.asr.language = self.cfg.source_lang
+                    self.asr._force_ja = "kotoba" in (self.cfg.model_size or "")
+                    self.asr.unload()
+                    continue
+                break
             if (getattr(self.asr, "_force_ja", False)
                     and getattr(self.cfg, "source_lang", "ja") != "ja"):
                 self.state = "error"

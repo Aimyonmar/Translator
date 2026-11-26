@@ -1293,7 +1293,21 @@ class ControlPanel(QWidget):
             self.lbl_route.setText(txt)
 
     def _set_input_mode(self, mode: str) -> list:
-        """切换输入语言：源语言、模型、目标语言一次到位，并立刻生效。"""
+        """切换输入语言：源语言、模型、目标语言一次到位，并立刻生效。
+
+        已经在该档时不再重复套预设：否则用户在识别页手动选了
+        medium / large-v3 后，只要再点一下已选中的语言按钮，模型就被
+        冲回预设档 —— 看起来就是「刚选的模型不生效」。
+        """
+        current = lang_mode.detect(self.cfg)
+        preset = lang_mode.PRESETS.get(mode)
+        if (preset is not None and current == mode
+                and str(getattr(self.cfg, "source_lang", "") or "") == preset["source"]):
+            self._sync_lang_ui()
+            self._refresh_route()
+            self._log("输入语言已是「%s」，模型保持当前选择：%s"
+                      % (lang_mode.MODE_LABELS[mode], self.cfg.model_size))
+            return []
         notes = lang_mode.apply(self.cfg, mode)
         self._sync_lang_ui()
         self._save_cfg("输入语言")
@@ -1430,8 +1444,9 @@ class ControlPanel(QWidget):
         idle = not self._running and not self._transcribing
         self.btn_start.setEnabled(not self._transcribing)
         self.btn_trs_start.setEnabled(idle)
-        self.cmb_model.setEnabled(idle)
-        self.cmb_dev.setEnabled(idle)
+        # 模型下拉在运行中也保持可用（热重载），只有转写期间要锁住
+        self.cmb_model.setEnabled(not self._transcribing)
+        self.cmb_dev.setEnabled(not self._transcribing)
 
     def _release_loaded(self, size: str) -> None:
         """卸载前释放已加载的同名模型，避免 Windows 上缓存文件被占用。
@@ -2316,8 +2331,9 @@ class ControlPanel(QWidget):
         for w in (self.txt_url, self.btn_url_probe, self.btn_url_go, self.btn_url_subs):
             w.setEnabled(not busy)
         self.btn_start.setEnabled(not busy)
-        self.cmb_model.setEnabled(not busy and not self._running)
-        self.cmb_dev.setEnabled(not busy and not self._running)
+        # 转写占着模型，期间锁住模型/设备下拉（运行中不锁，支持热重载）
+        self.cmb_model.setEnabled(not busy)
+        self.cmb_dev.setEnabled(not busy)
         self._refresh_models()
 
     def set_running(self, running: bool, paused: bool = False) -> None:
@@ -2343,9 +2359,11 @@ class ControlPanel(QWidget):
         self.btn_start.style().polish(self.btn_start)
         self.btn_pause.setText("继续" if paused else "暂停")
         self.btn_pause.setEnabled(running)
-        # 互斥：运行中不能开转写；转写中「开始翻译」已由 set_transcribing 关掉
-        self.cmb_model.setEnabled(not running and not self._transcribing)
-        self.cmb_dev.setEnabled(not running and not self._transcribing)
+        # 互斥：运行中不能开转写；转写中「开始翻译」已由 set_transcribing 关掉。
+        # 模型/设备运行中也允许改：改完由 on_model_changed 后台重载并热切换，
+        # 不再像以前那样把下拉锁死（用户会以为「换模型的模块坏了」）。
+        self.cmb_model.setEnabled(not self._transcribing)
+        self.cmb_dev.setEnabled(not self._transcribing)
         self.btn_trs_start.setEnabled(not running and not self._transcribing)
         # 运行中不让动模型缓存：换/删文件会让正在跑的识别器失去模型
         self._running = running
