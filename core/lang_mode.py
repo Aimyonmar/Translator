@@ -55,9 +55,17 @@ def apply(cfg, mode: str) -> list:
     return notes
 
 
-def route_text(cfg) -> str:
-    """顶栏常驻路由：输入语言 → 译文 · 模型。"""
+def route_text(cfg, transcribe_only: bool = None) -> str:
+    """顶栏常驻路由：输入语言 → 译文 · 模型。
+
+    transcribe_only 省略时读 cfg.transcribe_only；开启时目标位置显示「只转写」，
+    提醒当前不会调用翻译。
+    """
+    if transcribe_only is None:
+        transcribe_only = bool(getattr(cfg, "transcribe_only", False))
     src = SOURCE_LABELS.get(getattr(cfg, "source_lang", ""), cfg.source_lang)
+    if transcribe_only:
+        return f"{src} · 只转写 · {cfg.model_size}"
     tgt = TARGET_LABELS.get(getattr(cfg, "target_lang", ""), cfg.target_lang)
     return f"{src} → {tgt} · {cfg.model_size}"
 

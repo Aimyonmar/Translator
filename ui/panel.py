@@ -288,10 +288,23 @@ class ControlPanel(QWidget):
             self._mode_group.addButton(btn)
             self._mode_btns[mode] = btn
             row_mode.addWidget(btn)
+        # 只转写开关与语言档并列放在顶栏：任何页面、任何滚动位置都能点，
+        # 开启后整条链路不调翻译，字幕/记录/导出只留原文。
+        row_mode.addSpacing(12)
+        self.btn_tr_only = QPushButton("只转写")
+        self.btn_tr_only.setCheckable(True)
+        self.btn_tr_only.setFixedHeight(30)
+        self.btn_tr_only.setToolTip(
+            "只识别、不翻译：悬浮字幕、实时记录、TXT/SRT 导出都只有识别原文，"
+            "整条链路不调用翻译接口；识别语言仍由左侧三档决定。")
+        self.btn_tr_only.clicked.connect(
+            lambda _c=False: self._set_transcribe_only(self.btn_tr_only.isChecked()))
+        row_mode.addWidget(self.btn_tr_only)
         row_mode.addStretch(1)
         row_mode.addWidget(self.lbl_route)
         v.addLayout(row_mode)
         self._sync_mode_ui()
+        self._sync_transcribe_ui()
 
         # 主操作固定在顶栏：切到哪一页、内容滚到哪，开始/暂停/隐藏字幕都点得到
         row = QHBoxLayout()
@@ -1247,6 +1260,30 @@ class ControlPanel(QWidget):
         self._sync_capture_ui()
         self._refresh_route()
         self._log(f"采集源：{CAPTURE_LABELS[src]}")
+
+    def _sync_transcribe_ui(self) -> None:
+        """只转写开关跟随配置；按钮状态与 config 永远一致。"""
+        btn = getattr(self, "btn_tr_only", None)
+        if btn is None:
+            return
+        on = bool(getattr(self.cfg, "transcribe_only", False))
+        btn.blockSignals(True)
+        btn.setChecked(on)
+        btn.blockSignals(False)
+
+    def _set_transcribe_only(self, on: bool) -> None:
+        """切换只转写：落盘并立刻生效；识别语言/模型完全不动。"""
+        on = bool(on)
+        if on == bool(getattr(self.cfg, "transcribe_only", False)):
+            self._sync_transcribe_ui()
+            return
+        self.cfg.transcribe_only = on
+        self._sync_transcribe_ui()
+        self._save_cfg("只转写")
+        self.ctrl.on_transcribe_only_changed(on)
+        self._refresh_route()
+        self._log("只转写：开启（只出识别原文，不调用翻译）"
+                  if on else "只转写：关闭（恢复原文 + 译文）")
 
     def _refresh_route(self) -> None:
         if hasattr(self, "lbl_route"):

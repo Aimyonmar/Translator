@@ -94,6 +94,11 @@ class SubtitleOverlay(QWidget):
         self._dirty = True
         self.update()
 
+    def refresh_mode(self) -> None:
+        """只转写开关切换后重排版：原文从「未翻译占位」样式改为正式字幕样式。"""
+        self._relayout()
+        self.update()
+
     def _apply_fonts(self) -> None:
         main = theme.main_font_size(self.cfg.font_size)
         self.font_trans = QFont(FONT_FAMILY, main, QFont.Bold)
@@ -189,9 +194,11 @@ class SubtitleOverlay(QWidget):
                         y += fm_s.height() + src_gap
                     y += fm_s.height() * 0.3
             else:
-                # 译文还没到：先用原文占住这一行，等译文到了原地替换
+                # 只转写模式：原文就是最终字幕，用正常亮度显示；
+                # 其余情况是「译文还没到」，先压暗占位，等译文到了原地替换
+                kind = "t" if getattr(self.cfg, "transcribe_only", False) else "p"
                 for line in wrap_text(fm_t, src, inner):
-                    items.append(("p", line, y))
+                    items.append((kind, line, y))
                     y += fm_t.height() + line_gap
             y += block_gap
         return items, max(72, int(y + pad - block_gap)), pad, fm_t, fm_s

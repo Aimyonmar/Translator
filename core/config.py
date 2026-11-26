@@ -107,6 +107,9 @@ class AppConfig:
     # 翻译
     channel: str = "auto"
     target_lang: str = "zh-Hans"
+    # 只转写、不翻译：识别原文直接上屏/记录/导出，整条链路不发任何翻译请求。
+    # 识别语言仍由 source_lang 决定（顶栏三档）；关闭即回到双语行为。
+    transcribe_only: bool = False
     # 可选：填了 Key 会优先走自定义 API（质量最好）；不填则只用免费通道
     custom_type: str = "openai"        # openai | deepl
     custom_key: str = ""
@@ -323,6 +326,8 @@ class AppConfig:
             self.geometry = None
         if not self.target_lang:
             self.target_lang = "zh-Hans"
+        if not isinstance(self.transcribe_only, bool):
+            self.transcribe_only = False
         try:
             from .asr import MODEL_SIZES
         except Exception:

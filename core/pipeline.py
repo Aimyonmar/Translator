@@ -170,6 +170,9 @@ class Pipeline:
             self.on_status(f"模型加载失败：{exc}（首次需联网下载，可检查网络或换用更小模型）")
             return
         def probe_all():
+            # 只转写模式不碰任何翻译通道：既不发探测请求，也不起保活
+            if self.transcribe_only():
+                return
             if self.cfg.auto_proxy and not self.cfg.proxy:
                 found = self.translator.detect_local_proxy()
                 if found:
@@ -331,6 +334,10 @@ class Pipeline:
         """当前采集源：loopback（系统声音）| mic（麦克风）。"""
         return normalize_source(getattr(self.cfg, "capture_source", "loopback"))
 
+    def transcribe_only(self) -> bool:
+        """只转写、不翻译：整条链路不发翻译请求，字幕/记录/导出只留原文。"""
+        return bool(getattr(self.cfg, "transcribe_only", False))
+
     @staticmethod
     def device_matches_source(dev, source: str) -> bool:
         """保存的设备是否属于该采集源：麦克风只看 input，系统声音看回环/扬声器。"""
@@ -444,6 +451,8 @@ class Pipeline:
         """
         lang = self.asr._lang() or "auto"
         src = SOURCE_LABELS.get(lang, "自动" if lang == "auto" else lang)
+        if self.transcribe_only():
+            return f"{src} · 只转写（不翻译）· {self.asr.model_size} {self.asr.dev_info}"
         tgt = TARGET_LABELS.get(self.cfg.target_lang, self.cfg.target_lang)
         return f"{src} → {tgt} · {self.asr.model_size} {self.asr.dev_info}"
 
@@ -714,8 +723,10 @@ class Pipeline:
         # 机翻不认识游戏名（实测「原神→上帝」「エルデンリング→埃尔金戒指」），
         # 先把中文名塞进源文里，机翻就会照抄。上屏的原文保持识别原样，所以带两份。
         tr_text = text
-        # 标题术语表是日语专名 → 中文名的映射，非日语音频不要套用
-        if (getattr(self.cfg, "source_lang", "ja") == "ja"
+        # 标题术语表是日语专名 → 中文名的映射，非日语音频不要套用；
+        # 只转写模式也不做（术语替换只为机翻服务，原文上屏保持原样）
+        if (not self.transcribe_only()
+                and getattr(self.cfg, "source_lang", "ja") == "ja"
                 and getattr(self.cfg, "enable_title_glossary", True)):
             try:
                 from .namefix import apply_title_glossary
@@ -837,6 +848,17 @@ class Pipeline:
             if stop_evt.is_set():
                 break
             seq, tr_text, disp_text, meta = item
+            # 只转写：不建语境、不调翻译，直接按识别顺序把原文收尾上屏。
+            # 译文固定空串，下游（悬浮窗/实时记录/导出）天然只显示原文。
+            if self.transcribe_only():
+                t = time.perf_counter()
+                meta["req"] = 0
+                meta["channel"] = ""
+                meta["hedge"] = {}
+                with self._seq_lock:
+                    self._pending[seq] = (disp_text, "", meta, t, t)
+                self._flush_ordered()
+                continue
             # 带上最近几句做语境：只对自定义 LLM 通道生效，免费通道仍是单句
             ctx = ()
             if getattr(self.cfg, "enable_context", True):
@@ -928,7 +950,11 @@ class Pipeline:
             hedge = meta.get("hedge") or {}
             with self._count_lock:
                 self._counts["final"] += 1
-                self._counts["tgt" if out else "fail"] += 1
+                if out:
+                    self._counts["tgt"] += 1
+                elif not self.transcribe_only():
+                    # 只转写模式下「没有译文」是预期行为，不能记成失败
+                    self._counts["fail"] += 1
                 if out and hedge.get("rescued"):
                     self._counts["hedge"] += 1
             try:

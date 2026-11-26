@@ -209,6 +209,19 @@ class AppController:
         if tgt:
             self.panel.sig_log.emit(f"ZH  {tgt}")
 
+    def on_transcribe_only_changed(self, on: bool) -> None:
+        """只转写开关：只影响是否翻译，识别语言与模型都保持不变。"""
+        self.cfg.transcribe_only = bool(on)
+        if on:
+            # 开启后不再有任何翻译请求，包括后台保活 ping
+            try:
+                self.pipeline.translator.stop_keepalive()
+            except Exception:
+                pass
+        self.overlay.refresh_mode()
+        self.status("只转写已开启：字幕、实时记录、导出只保留识别原文（不调用翻译）"
+                    if on else "已关闭只转写：恢复原文 + 译文双语")
+
     # ------------------------------------------------------------ 托盘
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(_icon(), self.app)
